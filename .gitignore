@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller outputs
+build/
+dist/
+*.exe
+
+# Generated plots and local test outputs
+*.png
+_qa_*
+_tmp_*
+
+# Large/local sample data
+*.csv
+*.parquet
+*.pq
+*.xlsx
+*.xlsm
+*.xls
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

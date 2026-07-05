@@ -1,0 +1,1431 @@
+# Ebeam Data Visualizer 架构与实现说明
+
+本文档用于工程交接，说明本项目的脚本架构、实现方式、核心方法定义、数据处理流程和使用方式。
+
+## 1. 项目目标
+
+本项目用于 Ebeam 量测数据可视化，重点解决：
+
+- 支持 CSV、Parquet、小型 Excel 文件输入
+- 支持大数据量场景，避免一次性把全量数据读入 Python 内存
+- 支持按 wafer radius 聚合 CD
+- 支持按 `LayerType + LayerNO + Moduleindex` 分组查看 CD 分布
+- 支持同一张 Ebeam 图内不同 line 的 CD 加减/比值 loading
+- 支持带 UI 的可执行程序
+- 支持 Python 3.8 环境部署和公司内部重新打包
+
+## 2. 文件结构
+
+```text
+EbeamDataVisualizer
+├─ ebeam_backend.py
+├─ ui_app.py
+├─ plot_cd_by_radius.py
+├─ plot_layer_cd_distribution.py
+├─ plot_line_cd_loading.py
+├─ generate_demo_data.py
+├─ build_exe.ps1
+├─ requirements.txt
+├─ README.md
+├─ 脚本使用说明.md
+└─ 架构实现说明.md
+```
+
+各文件职责：
+
+| 文件 | 作用 |
+|---|---|
+| `ebeam_backend.py` | 核心数据后端，负责读文件、字段检查、DuckDB SQL 查询、聚合、抽样、过滤 |
+| `ui_app.py` | Tkinter UI 程序，负责文件选择、参数输入、调用后端、嵌入 Matplotlib 图 |
+| `plot_cd_by_radius.py` | 命令行脚本：画 CD by wafer radius |
+| `plot_layer_cd_distribution.py` | 命令行脚本：画不同 layer/line 的 CD 分布 |
+| `plot_line_cd_loading.py` | 命令行脚本：画 Line A/B 加减/比值 loading |
+| `generate_demo_data.py` | 生成模拟 Ebeam 数据，用于功能测试 |
+| `build_exe.ps1` | Windows PowerShell 打包脚本 |
+| `requirements.txt` | Python 依赖版本约束 |
+
+## 3. 依赖说明
+
+`requirements.txt`：
+
+```text
+duckdb>=0.10.0,<1.2.0
+matplotlib>=3.7.0,<3.8.0
+numpy>=1.24.0,<1.25.0
+pandas>=2.0.0,<2.1.0
+openpyxl>=3.1.0,<3.2.0
+pyinstaller>=6.0.0,<6.12.0
+```
+
+依赖用途：
+
+| 依赖 | 用途 |
+|---|---|
+| `duckdb` | 大文件 SQL 查询、聚合、抽样、过滤 |
+| `pandas` | 读取小型 Excel、接收 DuckDB 查询结果 |
+| `numpy` | 生成测试数据、分布曲线计算 |
+| `matplotlib` | 绘图 |
+| `openpyxl` | 读取 `.xlsx` |
+| `pyinstaller` | 打包 `.exe` |
+
+`duckdb` 是 Python 第三方依赖，不是标准库。如果只复制脚本到新环境，需要先安装依赖。
+
+## 4. 总体架构
+
+项目采用三层结构：
+
+```text
+用户输入 / UI / 命令行
+        ↓
+绘图脚本或 ui_app.py
+        ↓
+ebeam_backend.py
+        ↓
+DuckDB 查询 CSV / Parquet / Excel
+        ↓
+Pandas DataFrame 小结果集
+        ↓
+Matplotlib 绘图
+```
+
+关键设计点：
+
+- 大文件不直接用 `pandas.read_csv()` 全量读取
+- CSV / Parquet 通过 DuckDB 的 `read_csv_auto()` / `read_parquet()` 查询
+- 聚合在 DuckDB SQL 内完成，只把聚合结果转成 DataFrame
+- 自定义散点图可选择抽样或全量
+- Radius 是虚拟字段，由 `WaferPosX` 和 `WaferPosY` 动态计算
+
+## 5. 数据字段设计
+
+完整字段：
+
+```text
+DieIDX
+DieIDY
+WaferPosX
+WaferPosY
+ImageIDX
+CD
+BendingAngle
+LayerType
+LayerNO
+Moduleindex
+```
+
+字段用途：
+
+| 字段 | 用途 |
+|---|---|
+| `WaferPosX`, `WaferPosY` | 计算 wafer radius |
+| `CD` | 默认量测结果 |
+| `LayerType`, `LayerNO`, `Moduleindex` | 区分不同 line/layer |
+| `DieIDX`, `DieIDY`, `WaferPosX`, `WaferPosY`, `ImageIDX` | Line A/B 配对 join key |
+| `BendingAngle` | 可作为自定义 Y 轴或其他分析字段 |
+
+最小字段兼容：
+
+| 功能 | 最少字段 |
+|---|---|
+| CD by wafer radius | `WaferPosX`, `WaferPosY`, `CD` |
+| Layer CD distribution | `CD` |
+| Custom X-Y scatter | 用户选择的 X/Y 字段 |
+| Line CD loading | `DieIDX`, `DieIDY`, `WaferPosX`, `WaferPosY`, `ImageIDX`, `CD` |
+
+## 6. Radius 虚拟字段
+
+项目中定义：
+
+```python
+RADIUS_COLUMN = "Radius"
+```
+
+只要数据存在：
+
+```text
+WaferPosX
+WaferPosY
+```
+
+UI 就会把 `Radius` 作为可选字段加入 X/Y axis 下拉框。
+
+计算公式：
+
+```text
+Radius = sqrt(WaferPosX^2 + WaferPosY^2)
+```
+
+实际 SQL 表达式由 `radius_expr()` 生成。
+
+## 7. ebeam_backend.py 详细说明
+
+`ebeam_backend.py` 是核心模块。其他脚本和 UI 都调用它。
+
+### 7.1 常量
+
+```python
+DEFAULT_COLUMNS
+LAYER_COLUMNS
+JOIN_KEYS
+RADIUS_COLUMN
+```
+
+说明：
+
+- `DEFAULT_COLUMNS`：完整 Ebeam 字段列表
+- `LAYER_COLUMNS`：用于 line/layer 识别的字段
+- `JOIN_KEYS`：Line A/B 配对时使用的 join key
+- `RADIUS_COLUMN`：虚拟 Radius 字段名
+
+### 7.2 DataSource
+
+```python
+@dataclass
+class DataSource:
+    path: Path
+    relation_sql: str
+    con: duckdb.DuckDBPyConnection
+    temp_view: Optional[str] = None
+```
+
+作用：
+
+- 保存数据文件路径
+- 保存 DuckDB relation SQL
+- 保存 DuckDB connection
+- Excel 文件会注册成临时 view
+
+方法：
+
+```python
+close()
+```
+
+关闭 DuckDB 连接。
+
+### 7.3 quote_ident()
+
+```python
+def quote_ident(name: str) -> str
+```
+
+作用：给 SQL 字段名加双引号，避免字段名中有特殊字符或关键字冲突。
+
+示例：
+
+```python
+quote_ident("LayerNO")
+```
+
+输出：
+
+```text
+"LayerNO"
+```
+
+### 7.4 string_literal()
+
+```python
+def string_literal(value: str) -> str
+```
+
+作用：给 SQL 字符串值加单引号并转义内部单引号。
+
+用于过滤条件，例如：
+
+```sql
+cast("LayerType" AS VARCHAR) = 'M1'
+```
+
+### 7.5 make_connection()
+
+```python
+def make_connection(memory_limit: str = "4GB", threads: Optional[int] = None) -> duckdb.DuckDBPyConnection
+```
+
+作用：
+
+- 创建内存 DuckDB 连接
+- 设置 DuckDB 内存限制
+- 可选设置线程数
+
+默认内存限制：
+
+```text
+4GB
+```
+
+### 7.6 open_source()
+
+```python
+def open_source(path: os.PathLike, memory_limit: str = "4GB", threads: Optional[int] = None) -> DataSource
+```
+
+作用：根据输入文件格式创建 DuckDB 数据源。
+
+支持格式：
+
+| 格式 | 实现 |
+|---|---|
+| `.csv`, `.txt` | DuckDB `read_csv_auto()` |
+| `.parquet`, `.pq` | DuckDB `read_parquet()` |
+| `.xlsx`, `.xlsm`, `.xls` | Pandas 读取后注册到 DuckDB |
+
+CSV 实现：
+
+```python
+read_csv_auto(path, header=true, ignore_errors=true, sample_size=200000)
+```
+
+说明：
+
+- `header=true`：第一行作为字段名
+- `ignore_errors=true`：遇到少量坏行尽量跳过
+- `sample_size=200000`：自动类型推断采样行数
+
+### 7.7 list_columns()
+
+```python
+def list_columns(path: os.PathLike) -> List[str]
+```
+
+作用：读取输入文件字段名。
+
+实现方式：
+
+```sql
+DESCRIBE SELECT * FROM source LIMIT 0
+```
+
+UI 中点击 `Load Columns` 时调用。
+
+### 7.8 list_plot_columns()
+
+```python
+def list_plot_columns(path: os.PathLike) -> List[str]
+```
+
+作用：返回 UI 可画图字段。
+
+如果存在 `WaferPosX` 和 `WaferPosY`，会额外把 `Radius` 加到字段列表最前面。
+
+### 7.9 distinct_values()
+
+```python
+def distinct_values(path: os.PathLike, column: str, limit: int = 100) -> List[str]
+```
+
+作用：读取某个字段的 distinct 值。
+
+UI 中 `Load filter values` 按钮会调用它，用于显示候选：
+
+- `LayerType`
+- `LayerNO`
+- `Moduleindex`
+
+### 7.10 has_columns()
+
+```python
+def has_columns(columns: Sequence[str], required: Iterable[str]) -> bool
+```
+
+作用：判断字段列表是否包含所有 required 字段。
+
+大小写不敏感。
+
+### 7.11 missing_columns()
+
+```python
+def missing_columns(columns: Sequence[str], required: Iterable[str]) -> List[str]
+```
+
+作用：返回缺失字段列表。
+
+用于错误提示。
+
+### 7.12 validate_required_columns()
+
+```python
+def validate_required_columns(columns: Sequence[str], required: Iterable[str] = DEFAULT_COLUMNS) -> List[str]
+```
+
+作用：检查完整 Ebeam 字段是否缺失。
+
+当前主要作为工具函数保留。
+
+### 7.13 require_columns()
+
+```python
+def require_columns(path: os.PathLike, required: Iterable[str], feature_name: str) -> List[str]
+```
+
+作用：
+
+- 读取字段
+- 检查当前功能所需字段
+- 缺字段时抛出明确错误
+
+示例错误：
+
+```text
+CD by wafer radius needs missing column(s): WaferPosY
+```
+
+### 7.14 radius_expr()
+
+```python
+def radius_expr(x_col: str = "WaferPosX", y_col: str = "WaferPosY") -> str
+```
+
+作用：生成 DuckDB SQL 中计算 Radius 的表达式。
+
+输出类似：
+
+```sql
+sqrt(pow(try_cast("WaferPosX" AS DOUBLE), 2) + pow(try_cast("WaferPosY" AS DOUBLE), 2))
+```
+
+### 7.15 field_expr()
+
+```python
+def field_expr(field: str, columns: Sequence[str]) -> str
+```
+
+作用：把 UI 选择的字段转换成 SQL 数值表达式。
+
+逻辑：
+
+- 如果字段是 `Radius`，转成 radius SQL 表达式
+- 如果是普通字段，转成 `try_cast("字段" AS DOUBLE)`
+- 如果字段不存在，抛出错误
+
+### 7.16 layer_label_expr()
+
+```python
+def layer_label_expr(columns: Sequence[str]) -> str
+```
+
+作用：生成 layer 分组标签 SQL。
+
+如果存在字段，则组合：
+
+```text
+LayerType=... | LayerNO=... | Module=...
+```
+
+如果三个字段都不存在，则使用：
+
+```text
+All data
+```
+
+因此只有 `CD` 一列时，也能画一个整体分布。
+
+### 7.17 split_filter_values()
+
+```python
+def split_filter_values(value: Union[str, Sequence[str]]) -> List[str]
+```
+
+作用：解析多值筛选。
+
+支持：
+
+```text
+M1,M2
+M1;M2
+["M1", "M2"]
+```
+
+返回：
+
+```python
+["M1", "M2"]
+```
+
+### 7.18 where_from_filters()
+
+```python
+def where_from_filters(filters: Optional[Dict[str, Union[str, Sequence[str]]]], columns: Optional[Sequence[str]] = None) -> str
+```
+
+作用：根据 UI 或脚本传入的 filters 生成 SQL `WHERE` 子句。
+
+单值：
+
+```python
+{"LayerType": "M1"}
+```
+
+生成：
+
+```sql
+WHERE cast("LayerType" AS VARCHAR) = 'M1'
+```
+
+多值：
+
+```python
+{"LayerType": "M1,M2"}
+```
+
+生成：
+
+```sql
+WHERE cast("LayerType" AS VARCHAR) IN ('M1', 'M2')
+```
+
+### 7.19 query_radius_aggregate()
+
+```python
+def query_radius_aggregate(
+    path: os.PathLike,
+    value_col: str = "CD",
+    radius_bin: float = 500.0,
+    filters: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
+    memory_limit: str = "4GB",
+) -> pd.DataFrame
+```
+
+作用：计算 CD by wafer radius 聚合结果。
+
+必须字段：
+
+```text
+WaferPosX
+WaferPosY
+value_col
+```
+
+核心 SQL 逻辑：
+
+1. 计算 radius
+2. 按 `radius_bin` 分箱
+3. 每个 bin 计算：
+   - 平均值
+   - 标准差
+   - 最小值
+   - 最大值
+   - 点数
+
+返回 DataFrame 字段：
+
+```text
+radius_bin
+value_mean
+value_std
+value_min
+value_max
+n
+```
+
+UI 中 `CD by wafer radius` 使用该函数。
+
+### 7.20 query_xy()
+
+```python
+def query_xy(
+    path: os.PathLike,
+    x_col: str,
+    y_col: str,
+    sample_rows: int = 200000,
+    use_sample: bool = True,
+    filters: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
+    memory_limit: str = "4GB",
+) -> pd.DataFrame
+```
+
+作用：读取自定义 X/Y 散点图数据。
+
+支持：
+
+- 任意数值字段作为 X/Y
+- `Radius` 虚拟字段
+- 抽样
+- 全量读取
+- Layer 多值筛选
+
+抽样实现：
+
+```sql
+USING SAMPLE reservoir(N ROWS)
+```
+
+如果存在过滤条件，会先用 CTE 过滤：
+
+```sql
+WITH filtered AS (
+    SELECT * FROM source
+    WHERE ...
+)
+SELECT ...
+FROM filtered
+USING SAMPLE reservoir(...)
+```
+
+返回字段：
+
+```text
+x
+y
+layer_label
+```
+
+### 7.21 query_layer_histogram()
+
+```python
+def query_layer_histogram(
+    path: os.PathLike,
+    value_col: str = "CD",
+    bins: int = 80,
+    max_layers: int = 12,
+    filters: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
+    memory_limit: str = "4GB",
+) -> Tuple[pd.DataFrame, pd.DataFrame]
+```
+
+作用：计算不同 layer/line 的 CD 分布。
+
+必须字段：
+
+```text
+value_col
+```
+
+可选分组字段：
+
+```text
+LayerType
+LayerNO
+Moduleindex
+```
+
+实现步骤：
+
+1. 按 layer label 统计数量
+2. 取数量最多的 `max_layers` 个 layer
+3. 计算每组 mean、std、min、max
+4. 统一全局 min/max
+5. 按 bins 计算 histogram
+
+返回：
+
+```python
+hist, stats
+```
+
+`hist` 字段：
+
+```text
+layer_label
+bin_id
+bin_center
+n
+```
+
+`stats` 字段：
+
+```text
+layer_label
+n
+mean
+std
+min_value
+max_value
+```
+
+### 7.22 build_line_filter()
+
+```python
+def build_line_filter(layer_type: str = "", layer_no: str = "", moduleindex: str = "", columns: Optional[Sequence[str]] = None) -> str
+```
+
+作用：为 Line A/B 生成筛选 WHERE。
+
+它内部调用 `where_from_filters()`。
+
+### 7.23 query_line_loading()
+
+```python
+def query_line_loading(
+    path: os.PathLike,
+    line_a: Dict[str, str],
+    line_b: Dict[str, str],
+    operation: str = "subtract",
+    radius_bin: float = 500.0,
+    value_col: str = "CD",
+    memory_limit: str = "4GB",
+) -> pd.DataFrame
+```
+
+作用：计算 Line A/B 的 CD loading by radius。
+
+必须字段：
+
+```text
+DieIDX
+DieIDY
+WaferPosX
+WaferPosY
+ImageIDX
+value_col
+```
+
+配对键：
+
+```text
+DieIDX + DieIDY + WaferPosX + WaferPosY + ImageIDX
+```
+
+支持 operation：
+
+| operation | 计算 |
+|---|---|
+| `subtract` | A - B |
+| `add` | A + B |
+| `ratio` | A / B |
+
+返回 DataFrame 字段：
+
+```text
+radius_bin
+loading_mean
+loading_std
+loading_min
+loading_max
+n
+```
+
+## 8. UI 实现说明
+
+UI 文件：
+
+```text
+ui_app.py
+```
+
+主类：
+
+```python
+class EbeamVisualizerApp(tk.Tk)
+```
+
+### 8.1 UI 框架
+
+UI 使用：
+
+- `tkinter`
+- `ttk`
+- `matplotlib.backends.backend_tkagg.FigureCanvasTkAgg`
+
+布局：
+
+```text
+左侧滚动参数面板 | 右侧 Matplotlib 图表区域
+```
+
+左侧使用：
+
+```python
+tk.Canvas + ttk.Scrollbar
+```
+
+实现滚轮滚动，避免控件太多时底部看不到。
+
+### 8.2 主要 UI 参数
+
+文件与字段：
+
+```python
+input_path
+chart_type
+x_axis
+y_axis
+value_col
+```
+
+数据参数：
+
+```python
+radius_bin
+sample_rows
+data_mode
+max_layers
+operation
+```
+
+坐标范围：
+
+```python
+x_min
+x_max
+y_min
+y_max
+```
+
+绘图样式：
+
+```python
+line_color
+band_color
+outlier_color
+scatter_color
+line_width
+scatter_size
+x_label
+y_label
+axis_label_size
+axis_label_weight
+```
+
+普通图筛选：
+
+```python
+filter_layer_type
+filter_layer_no
+filter_moduleindex
+```
+
+Line A/B 筛选：
+
+```python
+a_layer_type
+a_layer_no
+a_moduleindex
+b_layer_type
+b_layer_no
+b_moduleindex
+```
+
+### 8.3 _build_ui()
+
+```python
+def _build_ui(self) -> None
+```
+
+作用：构建完整 UI。
+
+主要包含：
+
+- 文件选择
+- 图表类型选择
+- X/Y/value 字段选择
+- 半径 bin、抽样行数
+- 坐标范围
+- 绘图样式
+- 普通 layer 筛选
+- Line A/B 筛选
+- Plot / Save PNG 按钮
+- Matplotlib 图表区域
+
+### 8.4 browse_file()
+
+```python
+def browse_file(self) -> None
+```
+
+作用：弹出文件选择框。
+
+支持：
+
+```text
+csv, txt, parquet, pq, xlsx, xlsm, xls
+```
+
+选择后自动调用 `load_columns()`。
+
+### 8.5 load_columns()
+
+```python
+def load_columns(self) -> None
+```
+
+作用：
+
+- 调用 `list_columns()`
+- 调用 `list_plot_columns()`
+- 更新 X/Y/value 下拉框
+- 自动选择默认字段
+
+### 8.6 _pick_default_columns()
+
+```python
+def _pick_default_columns(self) -> None
+```
+
+默认逻辑：
+
+- 有 `Radius` 时，X 轴默认 `Radius`
+- 有 `CD` 时，Y/value 默认 `CD`
+
+### 8.7 on_chart_change()
+
+```python
+def on_chart_change(self, _event=None) -> None
+```
+
+作用：切换图表类型时更新提示。
+
+例如：
+
+- CD by radius 使用 Radius
+- Layer distribution 按 layer 字段分组
+- Custom scatter 使用用户选择的 X/Y
+
+### 8.8 normal_filters()
+
+```python
+def normal_filters(self)
+```
+
+作用：从普通筛选框中生成 filters dict。
+
+返回示例：
+
+```python
+{
+    "LayerType": "M1,M2",
+    "LayerNO": "1,2"
+}
+```
+
+该 filters 会传给：
+
+- `query_radius_aggregate()`
+- `query_layer_histogram()`
+- `query_xy()`
+
+### 8.9 load_filter_values()
+
+```python
+def load_filter_values(self) -> None
+```
+
+作用：读取并显示当前文件中的筛选候选值。
+
+读取字段：
+
+```text
+LayerType
+LayerNO
+Moduleindex
+```
+
+内部调用：
+
+```python
+distinct_values()
+```
+
+### 8.10 start_plot()
+
+```python
+def start_plot(self) -> None
+```
+
+作用：启动绘图线程。
+
+使用线程的原因：
+
+- DuckDB 查询大文件可能耗时
+- 避免 UI 主线程卡死
+
+### 8.11 _plot_worker()
+
+```python
+def _plot_worker(self, path: str) -> None
+```
+
+作用：后台线程中执行数据查询。
+
+根据 `chart_type` 分发：
+
+| chart_type | 调用 |
+|---|---|
+| `CD by wafer radius` | `query_radius_aggregate()` |
+| `Layer CD distribution` | `query_layer_histogram()` |
+| `Line CD loading` | `query_line_loading()` |
+| `Custom X-Y scatter` | `query_xy()` |
+
+查询结果放入：
+
+```python
+self.result_queue
+```
+
+### 8.12 _poll_results()
+
+```python
+def _poll_results(self) -> None
+```
+
+作用：UI 主线程定期检查后台查询结果。
+
+每 200 ms 执行一次：
+
+```python
+self.after(200, self._poll_results)
+```
+
+### 8.13 _draw()
+
+```python
+def _draw(self, kind: str, payload: object) -> None
+```
+
+作用：根据查询结果绘图。
+
+支持 kind：
+
+| kind | 绘图 |
+|---|---|
+| `radius` | mean 曲线、±1σ 阴影、min/max 点 |
+| `layer_dist` | 多 layer 分布曲线 |
+| `line_loading` | loading mean、±1σ、min/max、零线 |
+| `scatter` | X/Y 散点 |
+
+样式来自 UI 输入：
+
+- 线颜色
+- 阴影颜色
+- 散点颜色
+- 线宽
+- 散点大小
+- X/Y label
+- X/Y label 字号和粗细
+
+### 8.14 _axis_label()
+
+```python
+def _axis_label(self, axis: str, default: str) -> str
+```
+
+作用：如果用户输入了 X/Y label，则使用自定义文字；否则使用默认字段名。
+
+### 8.15 _apply_axis_label_style()
+
+```python
+def _apply_axis_label_style(self, ax) -> None
+```
+
+作用：设置 X/Y 轴标题大小和粗细。
+
+参数来自：
+
+```python
+axis_label_size
+axis_label_weight
+```
+
+### 8.16 _apply_axis_range_to_ax()
+
+```python
+def _apply_axis_range_to_ax(self, ax) -> None
+```
+
+作用：根据 UI 输入设置 X/Y 显示范围。
+
+支持只填 min 或只填 max。
+
+### 8.17 apply_axis_range()
+
+```python
+def apply_axis_range(self) -> None
+```
+
+作用：图画完以后重新应用坐标范围。
+
+### 8.18 save_current_png()
+
+```python
+def save_current_png(self) -> None
+```
+
+作用：保存当前图为 PNG。
+
+## 9. 命令行绘图脚本
+
+### 9.1 plot_cd_by_radius.py
+
+入口函数：
+
+```python
+plot_cd_by_radius(
+    input_path: str,
+    output_path: str = "cd_by_radius.png",
+    value_col: str = "CD",
+    radius_bin: float = 500.0,
+    scatter_sample: int = 0,
+    scatter_all: bool = False,
+) -> Path
+```
+
+实现：
+
+1. 可选调用 `query_xy()` 读取抽样或全量散点
+2. 调用 `query_radius_aggregate()` 计算 radius-bin 聚合
+3. Matplotlib 绘制：
+   - raw scatter
+   - mean 曲线
+   - ±1σ 阴影
+   - count 柱状图
+
+命令行：
+
+```powershell
+python plot_cd_by_radius.py demo_ebeam.csv -o cd_by_radius.png
+python plot_cd_by_radius.py demo_ebeam.csv -o cd_by_radius.png --radius-bin 500
+python plot_cd_by_radius.py demo_ebeam.csv -o cd_by_radius.png --scatter-sample 20000
+python plot_cd_by_radius.py demo_ebeam.csv -o cd_by_radius.png --scatter-all
+```
+
+### 9.2 plot_layer_cd_distribution.py
+
+辅助函数：
+
+```python
+_normal_pdf(x: np.ndarray, mean: float, std: float) -> np.ndarray
+```
+
+作用：计算正态分布 PDF，用于叠加参考虚线。
+
+入口函数：
+
+```python
+plot_layer_cd_distribution(
+    input_path: str,
+    output_path: str = "layer_cd_distribution.png",
+    value_col: str = "CD",
+    bins: int = 80,
+    max_layers: int = 8,
+) -> Path
+```
+
+实现：
+
+1. 调用 `query_layer_histogram()`
+2. 按 layer 绘制 histogram share 曲线
+3. 叠加基于 mean/std 的正态分布参考线
+
+命令行：
+
+```powershell
+python plot_layer_cd_distribution.py demo_ebeam.csv -o layer_cd_distribution.png
+python plot_layer_cd_distribution.py demo_ebeam.csv -o layer_cd_distribution.png --bins 80 --max-layers 8
+```
+
+### 9.3 plot_line_cd_loading.py
+
+辅助函数：
+
+```python
+_line_spec(layer_type: str, layer_no: str, moduleindex: str) -> Dict[str, str]
+```
+
+作用：把命令行参数整理成 Line A/B dict。
+
+入口函数：
+
+```python
+plot_line_cd_loading(
+    input_path: str,
+    output_path: str = "line_cd_loading_by_radius.png",
+    a_layer_type: str = "",
+    a_layer_no: str = "",
+    a_moduleindex: str = "",
+    b_layer_type: str = "",
+    b_layer_no: str = "",
+    b_moduleindex: str = "",
+    operation: str = "subtract",
+    value_col: str = "CD",
+    radius_bin: float = 500.0,
+) -> Path
+```
+
+实现：
+
+1. 调用 `query_line_loading()`
+2. 绘制 loading mean 曲线
+3. 绘制 ±1σ 阴影
+4. 绘制 0 参考线
+
+命令行：
+
+```powershell
+python plot_line_cd_loading.py demo_ebeam.csv `
+  -o line_loading.png `
+  --a-layer-type M1 `
+  --a-layer-no 1 `
+  --b-layer-type M1 `
+  --b-layer-no 2 `
+  --operation subtract
+```
+
+## 10. 测试数据脚本
+
+文件：
+
+```text
+generate_demo_data.py
+```
+
+入口函数：
+
+```python
+generate_demo_data(output: str = "demo_ebeam.csv", rows: int = 300_000, seed: int = 7) -> Path
+```
+
+实现逻辑：
+
+1. 定义多组 line：
+
+```python
+("M0", 1, 0)
+("M0", 2, 0)
+("M1", 1, 0)
+("M1", 2, 0)
+("V0", 1, 1)
+("Poly", 1, 2)
+```
+
+2. 生成 wafer 上的随机半径和角度
+3. 转成 `WaferPosX`, `WaferPosY`
+4. 每个 ImageIDX 生成多条 line
+5. 生成 CD 和 BendingAngle
+6. 输出 CSV
+
+命令：
+
+```powershell
+python generate_demo_data.py --rows 300000
+python generate_demo_data.py --rows 1000000 -o my_demo.csv
+```
+
+## 11. 打包脚本
+
+文件：
+
+```text
+build_exe.ps1
+```
+
+内容逻辑：
+
+1. 安装依赖
+2. 调用 PyInstaller
+3. 输出 exe 路径
+
+命令：
+
+```powershell
+.\build_exe.ps1
+```
+
+等价命令：
+
+```powershell
+python -m pip install -r requirements.txt
+python -m PyInstaller `
+  --noconfirm `
+  --clean `
+  --windowed `
+  --name EbeamDataVisualizer `
+  --collect-all duckdb `
+  --collect-all matplotlib `
+  ui_app.py
+```
+
+输出：
+
+```text
+dist\EbeamDataVisualizer\EbeamDataVisualizer.exe
+```
+
+注意：
+
+- 当前是 one-folder 模式
+- 分发时要复制整个 `dist\EbeamDataVisualizer` 文件夹
+- 不要只复制单个 `.exe`
+
+## 12. 数据流示例
+
+### 12.1 CD by wafer radius
+
+```text
+UI 选择文件
+↓
+Load Columns
+↓
+选择 CD by wafer radius
+↓
+normal_filters() 生成筛选
+↓
+query_radius_aggregate()
+↓
+DuckDB 计算 Radius、分 bin、聚合
+↓
+返回小 DataFrame
+↓
+_draw("radius", df)
+↓
+Matplotlib 绘图
+```
+
+### 12.2 Custom X-Y scatter
+
+```text
+UI 选择 X/Y 字段
+↓
+选择 Sample 或 All rows
+↓
+normal_filters() 生成筛选
+↓
+query_xy()
+↓
+DuckDB 过滤、抽样或全量读取
+↓
+返回 x/y DataFrame
+↓
+_draw("scatter", df)
+```
+
+### 12.3 Line CD loading
+
+```text
+UI 输入 Line A filters
+UI 输入 Line B filters
+↓
+query_line_loading()
+↓
+DuckDB 分别构造 a、b 两个子查询
+↓
+按 JOIN_KEYS 配对
+↓
+计算 A-B / A+B / A/B
+↓
+按 Radius bin 聚合
+↓
+返回 loading DataFrame
+↓
+_draw("line_loading", df)
+```
+
+## 13. 大数据处理策略
+
+本项目大数据优化主要靠 DuckDB。
+
+策略：
+
+- CSV/Parquet 只在 DuckDB SQL 层扫描
+- Python 只接收聚合后的小结果集
+- Radius bin 聚合不读全量点到 Python
+- Histogram 由 SQL 计算 bin 计数
+- 散点图默认 reservoir 抽样
+- 如需查离群，radius 聚合结果包含 min/max
+- 如必须完整散点，可在 UI 中选择 `All rows`
+
+风险：
+
+- `All rows` 会把全部点读入 Python 并绘制，亿级数据可能很慢或内存不足
+- Excel 文件会通过 Pandas 整体读取，不适合大数据
+- Parquet 比 CSV 更适合重复分析
+
+## 14. 常见修改位置
+
+### 14.1 新增图表类型
+
+修改：
+
+```text
+ui_app.py
+```
+
+位置：
+
+- `_build_ui()` 中 `chart_box` 的 values
+- `_plot_worker()` 中添加分支
+- `_draw()` 中添加绘图分支
+
+如果需要新查询，优先在 `ebeam_backend.py` 新增 query 函数。
+
+### 14.2 新增筛选字段
+
+修改：
+
+- UI 中添加 `tk.StringVar`
+- `_build_ui()` 添加输入框
+- `normal_filters()` 添加字段
+- 后端不需要大改，因为 `where_from_filters()` 已支持任意字段
+
+### 14.3 修改 Radius 计算
+
+修改：
+
+```python
+radius_expr()
+```
+
+### 14.4 修改 Line A/B 配对规则
+
+修改：
+
+```python
+JOIN_KEYS
+query_line_loading()
+```
+
+### 14.5 修改默认颜色和样式
+
+修改：
+
+```python
+self.line_color
+self.band_color
+self.outlier_color
+self.scatter_color
+self.line_width
+self.scatter_size
+```
+
+## 15. 运行与验证命令
+
+安装依赖：
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+生成测试数据：
+
+```powershell
+python generate_demo_data.py --rows 120000
+```
+
+运行 UI：
+
+```powershell
+python ui_app.py
+```
+
+运行脚本：
+
+```powershell
+python plot_cd_by_radius.py demo_ebeam.csv -o cd_by_radius.png
+python plot_layer_cd_distribution.py demo_ebeam.csv -o layer_cd_distribution.png
+python plot_line_cd_loading.py demo_ebeam.csv -o line_loading.png --a-layer-type M1 --a-layer-no 1 --b-layer-type M1 --b-layer-no 2 --operation subtract
+```
+
+打包 exe：
+
+```powershell
+.\build_exe.ps1
+```
+
+## 16. 已知注意事项
+
+- 生产环境如果只复制 `.py` 文件，必须安装 `requirements.txt` 中依赖
+- 如果复制打包程序，要复制整个 `dist\EbeamDataVisualizer` 文件夹
+- `All rows` 散点模式不适合超大数据
+- Excel 只建议小文件测试
+- 如果 CSV 字段类型非常复杂，DuckDB 自动类型推断可能需要调整 `read_csv_auto()` 参数
+- 如果打包时无法覆盖旧 exe，通常是旧程序还在运行，关闭后重新打包即可
