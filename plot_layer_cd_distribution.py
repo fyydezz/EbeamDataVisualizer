@@ -14,6 +14,31 @@ from ebeam_backend import query_layer_histogram
 COLORS = ["#1F5A8A", "#C28E2C", "#6E8B3D", "#B05A7A", "#58606F", "#5B8C8C", "#8A6FB0", "#A85C3A"]
 
 
+def _parse_series_colors(text: str, labels) -> Dict[str, str]:
+    if not text:
+        return {}
+    color_map = {}
+    ordered_colors = []
+    tokens = []
+    for chunk in text.replace("\n", ";").split(";"):
+        tokens.extend([part.strip() for part in chunk.split(",") if part.strip()])
+    for token in tokens:
+        if ":" in token:
+            key, color = token.rsplit(":", 1)
+            key = key.strip()
+            color = color.strip()
+            if key and color:
+                for label in labels:
+                    if key == label or key in label:
+                        color_map[label] = color
+            continue
+        ordered_colors.append(token)
+    for index, color in enumerate(ordered_colors):
+        if index < len(labels) and labels[index] not in color_map:
+            color_map[labels[index]] = color
+    return color_map
+
+
 def _normal_pdf(x: np.ndarray, mean: float, std: float) -> np.ndarray:
     if not np.isfinite(std) or std <= 0:
         return np.zeros_like(x)
@@ -28,6 +53,7 @@ def plot_layer_cd_distribution(
     max_layers: int = 8,
     filters: Optional[Dict[str, str]] = None,
     series_mode: str = "overlay",
+    series_colors: str = "",
 ) -> Path:
     if series_mode not in {"combine", "overlay", "facets"}:
         raise ValueError("series_mode must be combine, overlay, or facets")
@@ -45,6 +71,7 @@ def plot_layer_cd_distribution(
         raise RuntimeError("No valid layer distribution data found.")
 
     labels = stats["layer_label"].astype(str).tolist()
+    color_map = _parse_series_colors(series_colors, labels)
     if series_mode == "facets" and len(labels) > 1:
         columns = 2
         rows = int(math.ceil(len(labels) / 2.0))
@@ -65,8 +92,9 @@ def plot_layer_cd_distribution(
             continue
         total = part["n"].sum()
         y = part["n"] / total
-        color = COLORS[index % len(COLORS)]
-        ax.plot(part["bin_center"], y, marker="o", markersize=2.5, linewidth=1.4, color=color, label="{} (n={})".format(label, int(total)))
+        color = color_map.get(label, COLORS[index % len(COLORS)])
+        legend_label = "{} (μ={:.4g}, σ={:.4g}, n={})".format(label, float(row["mean"]), float(row["std"]), int(total))
+        ax.plot(part["bin_center"], y, marker="o", markersize=2.5, linewidth=1.4, color=color, label=legend_label)
 
         x = np.linspace(part["bin_center"].min(), part["bin_center"].max(), 250)
         pdf = _normal_pdf(x, float(row["mean"]), float(row["std"]))
@@ -102,6 +130,7 @@ def main() -> None:
     parser.add_argument("--layer-no", default="", help="Comma-separated visible LayerNO values")
     parser.add_argument("--moduleindex", default="", help="Comma-separated visible Moduleindex values")
     parser.add_argument("--series-mode", choices=["combine", "overlay", "facets"], default="overlay")
+    parser.add_argument("--series-colors", default="", help="Comma-separated colors, or label-fragment:color pairs separated by semicolon")
     args = parser.parse_args()
 
     filters = {"LayerType": args.layer_type, "LayerNO": args.layer_no, "Moduleindex": args.moduleindex}
@@ -113,6 +142,7 @@ def main() -> None:
         args.max_layers,
         filters,
         args.series_mode,
+        args.series_colors,
     )
     print("Saved: {}".format(path))
 

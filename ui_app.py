@@ -53,6 +53,7 @@ class EbeamVisualizerApp(tk.Tk):
         self.band_color = tk.StringVar(value="#8FB6D9")
         self.outlier_color = tk.StringVar(value="#B05A7A")
         self.scatter_color = tk.StringVar(value="#1F5A8A")
+        self.series_colors = tk.StringVar()
         self.line_width = tk.DoubleVar(value=2.2)
         self.scatter_size = tk.DoubleVar(value=4.0)
         self.scatter_alpha = tk.DoubleVar(value=0.75)
@@ -219,28 +220,29 @@ class EbeamVisualizerApp(tk.Tk):
         style_frame.grid(row=26, column=0, sticky="ew", pady=(2, 8))
         style_frame.columnconfigure(1, weight=1)
         self._style_entry(style_frame, "Line color", self.line_color, 0, group="line")
-        self._style_entry(style_frame, "Band color", self.band_color, 1, group="band")
-        self._style_entry(style_frame, "Min/max color", self.outlier_color, 2, group="outlier")
-        self._style_entry(style_frame, "Scatter color", self.scatter_color, 3, group="scatter")
-        self._style_entry(style_frame, "Line width", self.line_width, 4, group="line")
-        self._style_entry(style_frame, "Scatter size", self.scatter_size, 5, group="scatter")
-        self._style_entry(style_frame, "Scatter alpha", self.scatter_alpha, 6, group="scatter")
-        self._style_entry(style_frame, "X label", self.x_label, 7, group="axis")
-        self._style_entry(style_frame, "Y label", self.y_label, 8, group="axis")
-        self._style_entry(style_frame, "Axis label size", self.axis_label_size, 9, group="axis")
+        self._style_entry(style_frame, "Series colors", self.series_colors, 1, group="line")
+        self._style_entry(style_frame, "Band color", self.band_color, 2, group="band")
+        self._style_entry(style_frame, "Min/max color", self.outlier_color, 3, group="outlier")
+        self._style_entry(style_frame, "Scatter color", self.scatter_color, 4, group="scatter")
+        self._style_entry(style_frame, "Line width", self.line_width, 5, group="line")
+        self._style_entry(style_frame, "Scatter size", self.scatter_size, 6, group="scatter")
+        self._style_entry(style_frame, "Scatter alpha", self.scatter_alpha, 7, group="scatter")
+        self._style_entry(style_frame, "X label", self.x_label, 8, group="axis")
+        self._style_entry(style_frame, "Y label", self.y_label, 9, group="axis")
+        self._style_entry(style_frame, "Axis label size", self.axis_label_size, 10, group="axis")
         axis_weight_label = ttk.Label(style_frame, text="Axis label weight")
-        axis_weight_label.grid(row=10, column=0, sticky="w", pady=(0, 3))
+        axis_weight_label.grid(row=11, column=0, sticky="w", pady=(0, 3))
         axis_weight_combo = ttk.Combobox(style_frame, textvariable=self.axis_label_weight, values=["normal", "bold"], state="readonly", width=14)
-        axis_weight_combo.grid(row=10, column=1, sticky="ew", padx=(6, 0), pady=(0, 3))
+        axis_weight_combo.grid(row=11, column=1, sticky="ew", padx=(6, 0), pady=(0, 3))
         self._remember_style_controls("axis", axis_weight_label, axis_weight_combo)
         radius_line_only = ttk.Checkbutton(style_frame, text="Radius chart line only", variable=self.radius_line_only, command=self.update_control_visibility)
-        radius_line_only.grid(row=11, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        radius_line_only.grid(row=12, column=0, columnspan=2, sticky="w", pady=(2, 0))
         self._remember_style_controls("radius_only", radius_line_only)
         scatter_by_image = ttk.Checkbutton(style_frame, text="Scatter mean by ImageID", variable=self.scatter_by_image)
-        scatter_by_image.grid(row=12, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        scatter_by_image.grid(row=13, column=0, columnspan=2, sticky="w", pady=(2, 0))
         self._remember_style_controls("scatter", scatter_by_image)
         apply_style = ttk.Button(style_frame, text="Apply Style", command=self.apply_plot_style)
-        apply_style.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        apply_style.grid(row=14, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self._remember_style_controls("axis", apply_style)
 
         sep = ttk.Separator(panel)
@@ -408,6 +410,7 @@ class EbeamVisualizerApp(tk.Tk):
     def _install_auto_style_traces(self) -> None:
         style_vars = [
             self.line_color,
+            self.series_colors,
             self.band_color,
             self.outlier_color,
             self.scatter_color,
@@ -833,6 +836,7 @@ class EbeamVisualizerApp(tk.Tk):
         scatter_size = max(float(self.scatter_size.get()), 0.1)
         scatter_alpha = min(max(float(self.scatter_alpha.get()), 0.0), 1.0)
         labels = self._payload_series_labels(kind, payload)
+        series_color_map = self._series_color_map(labels)
         axes_by_label, axes = self._create_series_axes(labels)
         overlay = self.series_mode.get() == "Overlay selected series"
         separate = self.series_mode.get() == "Separate panels"
@@ -842,7 +846,7 @@ class EbeamVisualizerApp(tk.Tk):
             for index, label in enumerate(labels):
                 ax = axes_by_label[label]
                 part = df[df["series_label"] == label].sort_values("radius_bin")
-                color, linestyle = self._series_style(index, line_color)
+                color, linestyle = self._series_style(index, line_color, label, series_color_map)
                 fill_color = color if len(labels) > 1 else band_color
                 ax.plot(part["radius_bin"], part["value_mean"], color=color, linestyle=linestyle, linewidth=line_width, label=label)
                 if not self.radius_line_only.get():
@@ -866,7 +870,7 @@ class EbeamVisualizerApp(tk.Tk):
             for index, label in enumerate(labels):
                 ax = axes_by_label[label]
                 part = df[df["series_label"] == label].sort_values("radius_bin")
-                color, linestyle = self._series_style(index, line_color)
+                color, linestyle = self._series_style(index, line_color, label, series_color_map)
                 ax.plot(part["radius_bin"], part["sigma"], color=color, linestyle=linestyle, linewidth=line_width, marker="o", markersize=max(scatter_size * 0.65, 1.0), label=label)
                 self._configure_axis(
                     ax,
@@ -882,8 +886,10 @@ class EbeamVisualizerApp(tk.Tk):
                 if part.empty:
                     continue
                 y = part["n"] / part["n"].sum()
-                color, linestyle = self._series_style(index, line_color)
-                ax.plot(part["bin_center"], y, linewidth=line_width, linestyle=linestyle, color=color, label=label)
+                color, linestyle = self._series_style(index, line_color, label, series_color_map)
+                stats_row = stats[stats["layer_label"].astype(str) == label]
+                legend_label = self._distribution_legend_label(label, stats_row.iloc[0] if not stats_row.empty else None, int(part["n"].sum()))
+                ax.plot(part["bin_center"], y, linewidth=line_width, linestyle=linestyle, color=color, label=legend_label)
                 self._configure_axis(
                     ax,
                     label if separate else "CD Distribution by Layer",
@@ -898,7 +904,7 @@ class EbeamVisualizerApp(tk.Tk):
             for index, label in enumerate(labels):
                 ax = axes_by_label[label]
                 part = df[df["series_label"] == label].sort_values("radius_bin")
-                color, linestyle = self._series_style(index, line_color)
+                color, linestyle = self._series_style(index, line_color, label, series_color_map)
                 fill_color = color if len(labels) > 1 else band_color
                 ax.plot(
                     part["radius_bin"],
@@ -933,7 +939,7 @@ class EbeamVisualizerApp(tk.Tk):
             for index, label in enumerate(labels):
                 ax = axes_by_label[label]
                 part = df[df["layer_label"] == label]
-                color, _linestyle = self._series_style(index, scatter_color)
+                color, _linestyle = self._series_style(index, scatter_color, label, series_color_map)
                 ax.scatter(part["x"], part["y"], s=scatter_size, alpha=scatter_alpha, color=color, linewidths=0, label=label)
                 self._configure_axis(
                     ax,
@@ -1016,10 +1022,50 @@ class EbeamVisualizerApp(tk.Tk):
         self.ax = visible_axes[0]
         return {label: visible_axes[index] for index, label in enumerate(labels)}, visible_axes
 
-    def _series_style(self, index: int, first_color: str):
-        color = first_color if index == 0 else SERIES_COLORS[index % len(SERIES_COLORS)]
+    def _series_color_map(self, labels):
+        text = self.series_colors.get().strip()
+        if not text:
+            return {}
+        color_map = {}
+        ordered_colors = []
+        tokens = []
+        for chunk in text.replace("\n", ";").split(";"):
+            tokens.extend([part.strip() for part in chunk.split(",") if part.strip()])
+        for token in tokens:
+            if ":" in token:
+                key, color = token.rsplit(":", 1)
+                key = key.strip()
+                color = color.strip()
+                if key and color:
+                    for label in labels:
+                        if key == label or key in label:
+                            color_map[label] = color
+                continue
+            ordered_colors.append(token)
+        for index, color in enumerate(ordered_colors):
+            if index < len(labels) and labels[index] not in color_map:
+                color_map[labels[index]] = color
+        return color_map
+
+    def _series_style(self, index: int, first_color: str, label: str = "", color_map=None):
+        if color_map and label in color_map:
+            color = color_map[label]
+        elif index == 0:
+            color = first_color
+        else:
+            color = SERIES_COLORS[index % len(SERIES_COLORS)]
         linestyle = SERIES_LINESTYLES[(index // len(SERIES_COLORS)) % len(SERIES_LINESTYLES)]
         return color, linestyle
+
+    def _distribution_legend_label(self, label: str, stats_row, total: int) -> str:
+        if stats_row is None:
+            return "{} (n={})".format(label, total)
+        mean = stats_row.get("mean")
+        std = stats_row.get("std")
+        try:
+            return "{} (μ={:.4g}, σ={:.4g}, n={})".format(label, float(mean), float(std), total)
+        except (TypeError, ValueError):
+            return "{} (n={})".format(label, total)
 
     def _configure_axis(self, ax, title: str, x_default: str, y_default: str) -> None:
         ax.set_title(title, fontsize=9 if self.series_mode.get() == "Separate panels" else 12)
