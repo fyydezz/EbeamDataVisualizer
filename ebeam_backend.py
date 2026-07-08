@@ -243,14 +243,14 @@ def query_radius_aggregate(
         sql = """
         WITH base AS (
             SELECT
-                floor(({r}) / {radius_bin}) * {radius_bin} + ({radius_bin} / 2.0) AS radius_bin,
+                cast(floor(({r}) / {radius_bin}) AS BIGINT) AS radius_bin_id,
                 try_cast({value_col} AS DOUBLE) AS value,
                 {series_expr} AS series_label
             FROM {source}
             {where_clause}
         )
         SELECT
-            radius_bin,
+            radius_bin_id * {radius_bin} + ({radius_bin} / 2.0) AS radius_bin,
             series_label,
             avg(value) AS value_mean,
             stddev_samp(value) AS value_std,
@@ -258,9 +258,9 @@ def query_radius_aggregate(
             max(value) AS value_max,
             count(*) AS n
         FROM base
-        WHERE radius_bin IS NOT NULL AND value IS NOT NULL
-        GROUP BY radius_bin, series_label
-        ORDER BY series_label, radius_bin
+        WHERE radius_bin_id IS NOT NULL AND value IS NOT NULL
+        GROUP BY radius_bin_id, series_label
+        ORDER BY series_label, radius_bin_id
         """.format(
             r=r,
             radius_bin=float(radius_bin),
@@ -305,21 +305,21 @@ def query_radius_sigma(
             sql = """
             WITH base AS (
                 SELECT
-                    floor(({r}) / {radius_bin}) * {radius_bin} + ({radius_bin} / 2.0) AS radius_bin,
+                    cast(floor(({r}) / {radius_bin}) AS BIGINT) AS radius_bin_id,
                     {value} AS value,
                     {series_expr} AS series_label
                 FROM {source}
                 {where_clause}
             )
             SELECT
-                radius_bin,
+                radius_bin_id * {radius_bin} + ({radius_bin} / 2.0) AS radius_bin,
                 series_label,
                 stddev_samp(value) AS sigma,
                 count(*) AS n
             FROM base
-            WHERE radius_bin IS NOT NULL AND value IS NOT NULL
-            GROUP BY radius_bin, series_label
-            ORDER BY series_label, radius_bin
+            WHERE radius_bin_id IS NOT NULL AND value IS NOT NULL
+            GROUP BY radius_bin_id, series_label
+            ORDER BY series_label, radius_bin_id
             """.format(
                 r=r,
                 radius_bin=float(radius_bin),
@@ -352,7 +352,7 @@ def query_radius_sigma(
                 GROUP BY image_id, series_label
             )
             SELECT
-                floor(radius_value / {radius_bin}) * {radius_bin} + ({radius_bin} / 2.0) AS radius_bin,
+                cast(floor(radius_value / {radius_bin}) AS BIGINT) * {radius_bin} + ({radius_bin} / 2.0) AS radius_bin,
                 series_label,
                 avg(image_sigma) AS sigma,
                 count(*) AS n
@@ -652,7 +652,7 @@ def query_line_loading(
         ),
         paired AS (
             SELECT
-                floor((a.radius_value) / {radius_bin}) * {radius_bin} + ({radius_bin} / 2.0) AS radius_bin,
+                cast(floor((a.radius_value) / {radius_bin}) AS BIGINT) AS radius_bin_id,
                 {metric} AS loading_value,
                 {paired_series} AS series_label
             FROM a
@@ -660,7 +660,7 @@ def query_line_loading(
             WHERE a.cd_value IS NOT NULL AND b.cd_value IS NOT NULL
         )
         SELECT
-            radius_bin,
+            radius_bin_id * {radius_bin} + ({radius_bin} / 2.0) AS radius_bin,
             series_label,
             avg(loading_value) AS loading_mean,
             stddev_samp(loading_value) AS loading_std,
@@ -668,9 +668,9 @@ def query_line_loading(
             max(loading_value) AS loading_max,
             count(*) AS n
         FROM paired
-        WHERE radius_bin IS NOT NULL AND loading_value IS NOT NULL
-        GROUP BY radius_bin, series_label
-        ORDER BY series_label, radius_bin
+        WHERE radius_bin_id IS NOT NULL AND loading_value IS NOT NULL
+        GROUP BY radius_bin_id, series_label
+        ORDER BY series_label, radius_bin_id
         """.format(
             image_col=quote_ident(actual_image_col),
             value=value,
@@ -756,7 +756,7 @@ def query_fin_center_loading(
         ),
         paired AS (
             SELECT
-                floor((a.radius_value) / {radius_bin}) * {radius_bin} + ({radius_bin} / 2.0) AS radius_bin,
+                cast(floor((a.radius_value) / {radius_bin}) AS BIGINT) AS radius_bin_id,
                 ((a.cd_value + c.cd_value) / 2.0) - b.cd_value AS loading_value,
                 {paired_series} AS series_label
             FROM a
@@ -764,7 +764,7 @@ def query_fin_center_loading(
             INNER JOIN c ON a.image_id = c.image_id
         )
         SELECT
-            radius_bin,
+            radius_bin_id * {radius_bin} + ({radius_bin} / 2.0) AS radius_bin,
             series_label,
             avg(loading_value) AS loading_mean,
             stddev_samp(loading_value) AS loading_std,
@@ -772,9 +772,9 @@ def query_fin_center_loading(
             max(loading_value) AS loading_max,
             count(*) AS n
         FROM paired
-        WHERE radius_bin IS NOT NULL AND loading_value IS NOT NULL
-        GROUP BY radius_bin, series_label
-        ORDER BY series_label, radius_bin
+        WHERE radius_bin_id IS NOT NULL AND loading_value IS NOT NULL
+        GROUP BY radius_bin_id, series_label
+        ORDER BY series_label, radius_bin_id
         """.format(
             image_col=quote_ident(actual_image_col),
             radius=r,
@@ -809,6 +809,7 @@ def query_wafer_value_heatmap(
     try:
         half = float(wafer_diameter) / 2.0
         bin_value = float(bin_size)
+        grid_max = int(math.ceil((2.0 * half) / bin_value)) - 1
         where = where_from_filters(filters, columns)
         value = "try_cast({} AS DOUBLE)".format(quote_ident(actual_value_col))
         x_value = "try_cast({} AS DOUBLE) - ({})".format(quote_ident(x_col), float(radius_center[0]))
@@ -824,18 +825,21 @@ def query_wafer_value_heatmap(
         ),
         binned AS (
             SELECT
-                floor((x + {half}) / {bin_size}) * {bin_size} - {half} + ({bin_size} / 2.0) AS x_bin,
-                floor((y + {half}) / {bin_size}) * {bin_size} - {half} + ({bin_size} / 2.0) AS y_bin,
+                cast(greatest(0, least({grid_max}, floor((x + {half}) / {bin_size}))) AS BIGINT) AS x_bin_id,
+                cast(greatest(0, least({grid_max}, floor((y + {half}) / {bin_size}))) AS BIGINT) AS y_bin_id,
                 value
             FROM base
             WHERE x IS NOT NULL AND y IS NOT NULL AND value IS NOT NULL
               AND sqrt(pow(x, 2) + pow(y, 2)) <= {half}
         )
-        SELECT x_bin, y_bin, avg(value) AS value_mean, min(value) AS value_min,
+        SELECT
+               x_bin_id * {bin_size} - {half} + ({bin_size} / 2.0) AS x_bin,
+               y_bin_id * {bin_size} - {half} + ({bin_size} / 2.0) AS y_bin,
+               avg(value) AS value_mean, min(value) AS value_min,
                max(value) AS value_max, count(*) AS n
         FROM binned
-        GROUP BY x_bin, y_bin
-        ORDER BY y_bin, x_bin
+        GROUP BY x_bin_id, y_bin_id
+        ORDER BY y_bin_id, x_bin_id
         """.format(
             x_value=x_value,
             y_value=y_value,
@@ -844,6 +848,7 @@ def query_wafer_value_heatmap(
             where_clause=where,
             half=half,
             bin_size=bin_value,
+            grid_max=grid_max,
         )
         return src.con.execute(sql).fetchdf()
     finally:
@@ -875,6 +880,7 @@ def query_wafer_loading_heatmap(
         b_where = build_line_filter(line_b.get("LayerType", ""), line_b.get("LayerNO", ""), line_b.get("Moduleindex", ""), columns)
         half = float(wafer_diameter) / 2.0
         bin_value = float(bin_size)
+        grid_max = int(math.ceil((2.0 * half) / bin_value)) - 1
         x_value = "try_cast({} AS DOUBLE) - ({})".format(quote_ident(x_col), float(radius_center[0]))
         y_value = "try_cast({} AS DOUBLE) - ({})".format(quote_ident(y_col), float(radius_center[1]))
         value = "try_cast({} AS DOUBLE)".format(quote_ident(actual_value_col))
@@ -927,18 +933,21 @@ def query_wafer_loading_heatmap(
         ),
         binned AS (
             SELECT
-                floor((x + {half}) / {bin_size}) * {bin_size} - {half} + ({bin_size} / 2.0) AS x_bin,
-                floor((y + {half}) / {bin_size}) * {bin_size} - {half} + ({bin_size} / 2.0) AS y_bin,
+                cast(greatest(0, least({grid_max}, floor((x + {half}) / {bin_size}))) AS BIGINT) AS x_bin_id,
+                cast(greatest(0, least({grid_max}, floor((y + {half}) / {bin_size}))) AS BIGINT) AS y_bin_id,
                 loading_value
             FROM paired
             WHERE x IS NOT NULL AND y IS NOT NULL AND loading_value IS NOT NULL
               AND sqrt(pow(x, 2) + pow(y, 2)) <= {half}
         )
-        SELECT x_bin, y_bin, avg(loading_value) AS value_mean, min(loading_value) AS value_min,
+        SELECT
+               x_bin_id * {bin_size} - {half} + ({bin_size} / 2.0) AS x_bin,
+               y_bin_id * {bin_size} - {half} + ({bin_size} / 2.0) AS y_bin,
+               avg(loading_value) AS value_mean, min(loading_value) AS value_min,
                max(loading_value) AS value_max, count(*) AS n
         FROM binned
-        GROUP BY x_bin, y_bin
-        ORDER BY y_bin, x_bin
+        GROUP BY x_bin_id, y_bin_id
+        ORDER BY y_bin_id, x_bin_id
         """.format(
             image_col=quote_ident(actual_image_col),
             x_value=x_value,
@@ -951,6 +960,7 @@ def query_wafer_loading_heatmap(
             metric=metric,
             half=half,
             bin_size=bin_value,
+            grid_max=grid_max,
         )
         return src.con.execute(sql).fetchdf()
     finally:

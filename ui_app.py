@@ -30,7 +30,7 @@ class EbeamVisualizerApp(tk.Tk):
         self.x_axis = tk.StringVar(value="WaferPosX")
         self.y_axis = tk.StringVar(value="CD")
         self.value_col = tk.StringVar(value="CD")
-        self.radius_bin = tk.DoubleVar(value=500.0)
+        self.radius_bin = tk.DoubleVar(value=5.0)
         self.radius_center_x = tk.StringVar(value="0")
         self.radius_center_y = tk.StringVar(value="0")
         self.wafer_diameter = tk.DoubleVar(value=300.0)
@@ -1093,14 +1093,13 @@ class EbeamVisualizerApp(tk.Tk):
     def _draw_wafer_heatmap(self, ax, df, title: str, colorbar_label: str) -> None:
         half = float(self.wafer_diameter.get()) / 2.0
         bin_size = float(self.heatmap_bin.get())
-        edges = np.arange(-half, half + bin_size, bin_size)
-        x_centers = edges[:-1] + bin_size / 2.0
-        y_centers = edges[:-1] + bin_size / 2.0
-        pivot = df.pivot_table(index="y_bin", columns="x_bin", values="value_mean", aggfunc="mean")
-        pivot = pivot.reindex(index=y_centers, columns=x_centers)
-        z = pivot.to_numpy()
+        x_centers, y_centers, z = self._heatmap_matrix(df, half, bin_size)
         mask_x, mask_y = np.meshgrid(x_centers, y_centers)
-        z = np.where(np.sqrt(mask_x ** 2 + mask_y ** 2) <= half, z, np.nan)
+        inside = np.sqrt(mask_x ** 2 + mask_y ** 2) <= half
+        z = np.where(inside, z, np.nan)
+        z = self._fill_heatmap_gaps(z, inside)
+        if not np.isfinite(z).any():
+            raise ValueError("No finite wafer heatmap cells found after binning. Try a larger Heatmap bin or clear filters.")
         vmin, vmax = self._color_limits()
         cmap = plt.get_cmap(self.colormap.get()).copy()
         cmap.set_bad((1, 1, 1, 0))
@@ -1123,6 +1122,49 @@ class EbeamVisualizerApp(tk.Tk):
         self._configure_axis(ax, title, "WaferPosX", "WaferPosY")
         cbar = self.fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label(colorbar_label)
+
+    def _heatmap_matrix(self, df, half: float, bin_size: float):
+        grid_count = max(int(math.ceil((2.0 * half) / bin_size)), 1)
+        first_center = -half + bin_size / 2.0
+        x_centers = first_center + np.arange(grid_count) * bin_size
+        y_centers = first_center + np.arange(grid_count) * bin_size
+        z = np.full((grid_count, grid_count), np.nan, dtype=float)
+        values = df[["x_bin", "y_bin", "value_mean"]].dropna().to_numpy(dtype=float)
+        if values.size:
+            x_idx = np.rint((values[:, 0] - first_center) / bin_size).astype(int)
+            y_idx = np.rint((values[:, 1] - first_center) / bin_size).astype(int)
+            valid = (x_idx >= 0) & (x_idx < grid_count) & (y_idx >= 0) & (y_idx < grid_count)
+            z[y_idx[valid], x_idx[valid]] = values[valid, 2]
+        return x_centers, y_centers, z
+
+    def _fill_heatmap_gaps(self, z, inside):
+        original = np.isfinite(z)
+        if not original.any():
+            return z
+        row_filled = self._interpolate_nan_axis(z, axis=1)
+        col_filled = self._interpolate_nan_axis(z, axis=0)
+        row_ok = np.isfinite(row_filled)
+        col_ok = np.isfinite(col_filled)
+        filled = z.copy()
+        both = (~original) & row_ok & col_ok
+        filled[both] = (row_filled[both] + col_filled[both]) / 2.0
+        row_only = (~original) & row_ok & ~col_ok
+        filled[row_only] = row_filled[row_only]
+        col_only = (~original) & ~row_ok & col_ok
+        filled[col_only] = col_filled[col_only]
+        filled[original] = z[original]
+        return np.where(inside, filled, np.nan)
+
+    def _interpolate_nan_axis(self, arr, axis: int):
+        work = arr.T.copy() if axis == 0 else arr.copy()
+        x = np.arange(work.shape[1])
+        out = np.full_like(work, np.nan, dtype=float)
+        for row_index in range(work.shape[0]):
+            row = work[row_index]
+            valid = np.isfinite(row)
+            if valid.any():
+                out[row_index] = np.interp(x, x[valid], row[valid])
+        return out.T if axis == 0 else out
 
     def _axis_label(self, axis: str, default: str) -> str:
         custom = self.x_label.get().strip() if axis == "x" else self.y_label.get().strip()

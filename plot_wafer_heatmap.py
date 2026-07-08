@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -12,6 +13,52 @@ from ebeam_backend import query_wafer_loading_heatmap, query_wafer_value_heatmap
 
 def _line_spec(layer_type: str, layer_no: str, moduleindex: str) -> Dict[str, str]:
     return {"LayerType": layer_type, "LayerNO": layer_no, "Moduleindex": moduleindex}
+
+
+def _interpolate_nan_axis(arr: np.ndarray, axis: int) -> np.ndarray:
+    work = arr.T.copy() if axis == 0 else arr.copy()
+    x = np.arange(work.shape[1])
+    out = np.full_like(work, np.nan, dtype=float)
+    for row_index in range(work.shape[0]):
+        row = work[row_index]
+        valid = np.isfinite(row)
+        if valid.any():
+            out[row_index] = np.interp(x, x[valid], row[valid])
+    return out.T if axis == 0 else out
+
+
+def _fill_heatmap_gaps(z: np.ndarray, inside: np.ndarray) -> np.ndarray:
+    original = np.isfinite(z)
+    if not original.any():
+        return z
+    row_filled = _interpolate_nan_axis(z, axis=1)
+    col_filled = _interpolate_nan_axis(z, axis=0)
+    row_ok = np.isfinite(row_filled)
+    col_ok = np.isfinite(col_filled)
+    filled = z.copy()
+    both = (~original) & row_ok & col_ok
+    filled[both] = (row_filled[both] + col_filled[both]) / 2.0
+    row_only = (~original) & row_ok & ~col_ok
+    filled[row_only] = row_filled[row_only]
+    col_only = (~original) & ~row_ok & col_ok
+    filled[col_only] = col_filled[col_only]
+    filled[original] = z[original]
+    return np.where(inside, filled, np.nan)
+
+
+def _heatmap_matrix(df, half: float, bin_size: float):
+    grid_count = max(int(math.ceil((2.0 * half) / bin_size)), 1)
+    first_center = -half + bin_size / 2.0
+    x_centers = first_center + np.arange(grid_count) * bin_size
+    y_centers = first_center + np.arange(grid_count) * bin_size
+    z = np.full((grid_count, grid_count), np.nan, dtype=float)
+    values = df[["x_bin", "y_bin", "value_mean"]].dropna().to_numpy(dtype=float)
+    if values.size:
+        x_idx = np.rint((values[:, 0] - first_center) / bin_size).astype(int)
+        y_idx = np.rint((values[:, 1] - first_center) / bin_size).astype(int)
+        valid = (x_idx >= 0) & (x_idx < grid_count) & (y_idx >= 0) & (y_idx < grid_count)
+        z[y_idx[valid], x_idx[valid]] = values[valid, 2]
+    return x_centers, y_centers, z
 
 
 def _draw_heatmap(
@@ -30,14 +77,13 @@ def _draw_heatmap(
 
     half = float(wafer_diameter) / 2.0
     bin_value = float(bin_size)
-    edges = np.arange(-half, half + bin_value, bin_value)
-    x_centers = edges[:-1] + bin_value / 2.0
-    y_centers = edges[:-1] + bin_value / 2.0
-    pivot = df.pivot_table(index="y_bin", columns="x_bin", values="value_mean", aggfunc="mean")
-    pivot = pivot.reindex(index=y_centers, columns=x_centers)
-    z = pivot.to_numpy()
+    x_centers, y_centers, z = _heatmap_matrix(df, half, bin_value)
     mask_x, mask_y = np.meshgrid(x_centers, y_centers)
-    z = np.where(np.sqrt(mask_x ** 2 + mask_y ** 2) <= half, z, np.nan)
+    inside = np.sqrt(mask_x ** 2 + mask_y ** 2) <= half
+    z = np.where(inside, z, np.nan)
+    z = _fill_heatmap_gaps(z, inside)
+    if not np.isfinite(z).any():
+        raise RuntimeError("No finite wafer heatmap cells found after binning. Try a larger bin size or clear filters.")
 
     output = Path(output_path).resolve()
     fig, ax = plt.subplots(figsize=(8.2, 7.2), dpi=150)
