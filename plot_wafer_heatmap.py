@@ -15,35 +15,83 @@ def _line_spec(layer_type: str, layer_no: str, moduleindex: str) -> Dict[str, st
     return {"LayerType": layer_type, "LayerNO": layer_no, "Moduleindex": moduleindex}
 
 
-def _interpolate_nan_axis(arr: np.ndarray, axis: int) -> np.ndarray:
-    work = arr.T.copy() if axis == 0 else arr.copy()
-    x = np.arange(work.shape[1])
-    out = np.full_like(work, np.nan, dtype=float)
-    for row_index in range(work.shape[0]):
-        row = work[row_index]
-        valid = np.isfinite(row)
-        if valid.any():
-            out[row_index] = np.interp(x, x[valid], row[valid])
-    return out.T if axis == 0 else out
+def _shift_grid(values: np.ndarray, dy: int, dx: int, fill_value=np.nan) -> np.ndarray:
+    shifted = np.full_like(values, fill_value)
+    if abs(dy) >= values.shape[0] or abs(dx) >= values.shape[1]:
+        return shifted
+    source_y0, source_y1 = max(0, -dy), values.shape[0] - max(0, dy)
+    source_x0, source_x1 = max(0, -dx), values.shape[1] - max(0, dx)
+    target_y0, target_y1 = max(0, dy), values.shape[0] - max(0, -dy)
+    target_x0, target_x1 = max(0, dx), values.shape[1] - max(0, -dx)
+    shifted[target_y0:target_y1, target_x0:target_x1] = values[source_y0:source_y1, source_x0:source_x1]
+    return shifted
 
 
-def _fill_heatmap_gaps(z: np.ndarray, inside: np.ndarray) -> np.ndarray:
-    original = np.isfinite(z)
-    if not original.any():
+def _nearest_image_completion(z: np.ndarray, inside: np.ndarray) -> np.ndarray:
+    valid = np.isfinite(z) & inside
+    if not valid.any():
         return z
-    row_filled = _interpolate_nan_axis(z, axis=1)
-    col_filled = _interpolate_nan_axis(z, axis=0)
-    row_ok = np.isfinite(row_filled)
-    col_ok = np.isfinite(col_filled)
-    filled = z.copy()
-    both = (~original) & row_ok & col_ok
-    filled[both] = (row_filled[both] + col_filled[both]) / 2.0
-    row_only = (~original) & row_ok & ~col_ok
-    filled[row_only] = row_filled[row_only]
-    col_only = (~original) & ~row_ok & col_ok
-    filled[col_only] = col_filled[col_only]
+    rows, cols = z.shape
+    yy, xx = np.indices(z.shape)
+    nearest_y = np.where(valid, yy, -1)
+    nearest_x = np.where(valid, xx, -1)
+    step = 1
+    while step < max(rows, cols):
+        step *= 2
+    while step:
+        current_valid = nearest_y >= 0
+        current_distance = np.where(
+            current_valid,
+            (yy - nearest_y) ** 2 + (xx - nearest_x) ** 2,
+            np.inf,
+        )
+        for dy in (-step, 0, step):
+            for dx in (-step, 0, step):
+                if dy == 0 and dx == 0:
+                    continue
+                candidate_y = _shift_grid(nearest_y, dy, dx, fill_value=-1)
+                candidate_x = _shift_grid(nearest_x, dy, dx, fill_value=-1)
+                candidate_valid = candidate_y >= 0
+                candidate_distance = (yy - candidate_y) ** 2 + (xx - candidate_x) ** 2
+                replace = candidate_valid & ((~current_valid) | (candidate_distance < current_distance))
+                nearest_y[replace] = candidate_y[replace]
+                nearest_x[replace] = candidate_x[replace]
+                current_valid[replace] = True
+                current_distance[replace] = candidate_distance[replace]
+        step //= 2
+    completed = z.copy()
+    missing = inside & ~np.isfinite(completed) & (nearest_y >= 0)
+    completed[missing] = z[nearest_y[missing], nearest_x[missing]]
+    return np.where(inside, completed, np.nan)
+
+
+def _smooth_heatmap_gaps(z: np.ndarray, inside: np.ndarray) -> np.ndarray:
+    """Use local averaging first, then nearest-image completion for display only."""
+    filled = np.where(inside, z, np.nan).copy()
+    if not np.isfinite(filled).any():
+        return filled
+    original = np.isfinite(filled)
+    neighbours = [
+        (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+        (-1, -1, 0.707), (-1, 1, 0.707), (1, -1, 0.707), (1, 1, 0.707),
+    ]
+    for _ in range(32):
+        missing = inside & ~np.isfinite(filled)
+        if not missing.any():
+            break
+        numerator = np.zeros_like(filled, dtype=float)
+        denominator = np.zeros_like(filled, dtype=float)
+        for dy, dx, weight in neighbours:
+            neighbour = _shift_grid(filled, dy, dx)
+            valid = np.isfinite(neighbour)
+            numerator[valid] += neighbour[valid] * weight
+            denominator[valid] += weight
+        update = missing & (denominator > 0)
+        if not update.any():
+            break
+        filled[update] = numerator[update] / denominator[update]
     filled[original] = z[original]
-    return np.where(inside, filled, np.nan)
+    return _nearest_image_completion(filled, inside)
 
 
 def _heatmap_matrix(df, half: float, bin_size: float):
@@ -52,12 +100,17 @@ def _heatmap_matrix(df, half: float, bin_size: float):
     x_centers = first_center + np.arange(grid_count) * bin_size
     y_centers = first_center + np.arange(grid_count) * bin_size
     z = np.full((grid_count, grid_count), np.nan, dtype=float)
-    values = df[["x_bin", "y_bin", "value_mean"]].dropna().to_numpy(dtype=float)
-    if values.size:
+    if {"x_bin_id", "y_bin_id"}.issubset(df.columns):
+        values = df[["x_bin_id", "y_bin_id", "value_mean"]].dropna().to_numpy(dtype=float)
+        x_idx = values[:, 0].astype(int)
+        y_idx = values[:, 1].astype(int)
+    else:
+        values = df[["x_bin", "y_bin", "value_mean"]].dropna().to_numpy(dtype=float)
         x_idx = np.rint((values[:, 0] - first_center) / bin_size).astype(int)
         y_idx = np.rint((values[:, 1] - first_center) / bin_size).astype(int)
+    if values.size:
         valid = (x_idx >= 0) & (x_idx < grid_count) & (y_idx >= 0) & (y_idx < grid_count)
-        z[y_idx[valid], x_idx[valid]] = values[valid, 2]
+        z[y_idx[valid], x_idx[valid]] = values[valid, -1]
     return x_centers, y_centers, z
 
 
@@ -71,6 +124,7 @@ def _draw_heatmap(
     cmap: str = "jet",
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
+    render_style: str = "smooth",
 ) -> Path:
     if df.empty:
         raise RuntimeError("No valid wafer heatmap data found.")
@@ -81,7 +135,8 @@ def _draw_heatmap(
     mask_x, mask_y = np.meshgrid(x_centers, y_centers)
     inside = np.sqrt(mask_x ** 2 + mask_y ** 2) <= half
     z = np.where(inside, z, np.nan)
-    z = _fill_heatmap_gaps(z, inside)
+    if render_style == "smooth":
+        z = _smooth_heatmap_gaps(z, inside)
     if not np.isfinite(z).any():
         raise RuntimeError("No finite wafer heatmap cells found after binning. Try a larger bin size or clear filters.")
 
@@ -94,7 +149,7 @@ def _draw_heatmap(
         extent=(-half, half, -half, half),
         origin="lower",
         cmap=cmap_obj,
-        interpolation="bilinear",
+        interpolation="bilinear" if render_style == "smooth" else "nearest",
         vmin=vmin,
         vmax=vmax,
     )
@@ -128,6 +183,7 @@ def plot_wafer_value_heatmap(
     cmap: str = "jet",
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
+    render_style: str = "smooth",
 ) -> Path:
     df = query_wafer_value_heatmap(
         input_path,
@@ -137,7 +193,7 @@ def plot_wafer_value_heatmap(
         filters=filters,
         radius_center=(center_x, center_y),
     )
-    return _draw_heatmap(df, output_path, "Wafer {} Heatmap".format(value_col), value_col, wafer_diameter, bin_size, cmap, vmin, vmax)
+    return _draw_heatmap(df, output_path, "Wafer {} Heatmap".format(value_col), value_col, wafer_diameter, bin_size, cmap, vmin, vmax, render_style)
 
 
 def plot_wafer_loading_heatmap(
@@ -158,6 +214,7 @@ def plot_wafer_loading_heatmap(
     cmap: str = "jet",
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
+    render_style: str = "smooth",
 ) -> Path:
     df = query_wafer_loading_heatmap(
         input_path,
@@ -171,7 +228,7 @@ def plot_wafer_loading_heatmap(
     )
     label = "{} loading".format(value_col)
     title = "Wafer Loading Heatmap ({})".format({"subtract": "A - B", "add": "A + B", "ratio": "A / B"}[operation])
-    return _draw_heatmap(df, output_path, title, label, wafer_diameter, bin_size, cmap, vmin, vmax)
+    return _draw_heatmap(df, output_path, title, label, wafer_diameter, bin_size, cmap, vmin, vmax, render_style)
 
 
 def main() -> None:
@@ -187,6 +244,7 @@ def main() -> None:
     parser.add_argument("--cmap", default="")
     parser.add_argument("--vmin", type=float, default=None)
     parser.add_argument("--vmax", type=float, default=None)
+    parser.add_argument("--render-style", choices=["smooth", "cells"], default="smooth")
     parser.add_argument("--layer-type", default="", help="Value heatmap LayerType filter")
     parser.add_argument("--layer-no", default="", help="Value heatmap LayerNO filter")
     parser.add_argument("--moduleindex", default="", help="Value heatmap Moduleindex filter")
@@ -213,6 +271,7 @@ def main() -> None:
             args.cmap or "jet",
             args.vmin,
             args.vmax,
+            args.render_style,
         )
     else:
         path = plot_wafer_loading_heatmap(
@@ -233,6 +292,7 @@ def main() -> None:
             args.cmap or "jet",
             args.vmin,
             args.vmax,
+            args.render_style,
         )
     print("Saved: {}".format(path))
 

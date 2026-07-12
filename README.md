@@ -12,6 +12,7 @@ Windows-friendly Ebeam data visualization toolkit for large CSV/Parquet producti
 | `plot_layer_cd_distribution.py` | Layer value distribution |
 | `plot_line_cd_loading.py` | Line A/B loading by wafer radius |
 | `plot_wafer_heatmap.py` | Wafer value/loading heatmap |
+| `plot_die_map.py` | Value map by DieIDX/DieIDY |
 | `generate_demo_data.py` | Generate synthetic test data |
 | `build_exe.ps1` | Build Windows executable |
 | `requirements.txt` | Python dependencies |
@@ -78,6 +79,12 @@ Wafer loading heatmap:
 python plot_wafer_heatmap.py demo_ebeam_imageid_mm.csv -o wafer_loading_heatmap.png --mode loading --value-col CD --a-layer-type M0 --a-layer-no 1 --b-layer-type M0 --b-layer-no 2 --operation subtract --bin-size 5 --wafer-diameter 300 --cmap coolwarm --vmin -0.5 --vmax 0.5
 ```
 
+By Die value map (`DieIDX=0`, `DieIDY=0` is the map center):
+
+```powershell
+python plot_die_map.py demo_ebeam_imageid_mm.csv -o die_cd_map.png --value-col CD --die-size-x 10 --die-size-y 10 --wafer-diameter 300 --vmin 12 --vmax 15
+```
+
 ## Build EXE
 
 ```powershell
@@ -99,5 +106,7 @@ Copy the full `dist\EbeamDataVisualizer` folder, not only the `.exe`.
 - Avoid Excel for very large data.
 - Radius and loading charts aggregate in DuckDB before returning data to Python.
 - Scatter can use ImageID-level means to reduce overplotting.
-- Heatmap bins aggregate in DuckDB and return only grid-level results.
+- Wafer heatmaps average every ImageID first, then aggregate image-level values into bins.
+- Smooth wafer heatmaps use local completion plus nearest-image completion only for display, so small bins do not leave white holes; choose `Measured cells` in the UI to see only measured bins.
+- By Die maps also use ImageID-level weighting when ImageID is available.
 - Fix `Color min` and `Color max` when comparing different wafers.

@@ -801,7 +801,10 @@ def query_wafer_value_heatmap(
     radius_center: Tuple[float, float] = (0.0, 0.0),
     memory_limit: str = "4GB",
 ) -> pd.DataFrame:
-    columns = require_columns(path, ["WaferPosX", "WaferPosY", value_col], "Wafer value heatmap")
+    # A heatmap point represents one acquired image, not one raw measurement row.
+    # This prevents images with more measurement points from receiving more weight.
+    columns = require_columns(path, ["ImageID", "WaferPosX", "WaferPosY", value_col], "Wafer value heatmap")
+    actual_image_col = resolve_column(columns, "ImageID")
     x_col = resolve_column(columns, "WaferPosX")
     y_col = resolve_column(columns, "WaferPosY")
     actual_value_col = resolve_column(columns, value_col)
@@ -809,38 +812,57 @@ def query_wafer_value_heatmap(
     try:
         half = float(wafer_diameter) / 2.0
         bin_value = float(bin_size)
+        if half <= 0 or bin_value <= 0:
+            raise ValueError("Wafer diameter and heatmap bin size must be greater than zero.")
         grid_max = int(math.ceil((2.0 * half) / bin_value)) - 1
         where = where_from_filters(filters, columns)
         value = "try_cast({} AS DOUBLE)".format(quote_ident(actual_value_col))
         x_value = "try_cast({} AS DOUBLE) - ({})".format(quote_ident(x_col), float(radius_center[0]))
         y_value = "try_cast({} AS DOUBLE) - ({})".format(quote_ident(y_col), float(radius_center[1]))
         sql = """
-        WITH base AS (
+        WITH raw AS (
             SELECT
+                cast({image_col} AS VARCHAR) AS image_id,
                 {x_value} AS x,
                 {y_value} AS y,
                 {value} AS value
             FROM {source}
             {where_clause}
         ),
+        image_values AS (
+            SELECT
+                image_id,
+                avg(x) AS x,
+                avg(y) AS y,
+                avg(value) AS image_value,
+                count(*) AS raw_n
+            FROM raw
+            WHERE image_id IS NOT NULL AND x IS NOT NULL AND y IS NOT NULL AND value IS NOT NULL
+            GROUP BY image_id
+        ),
         binned AS (
             SELECT
                 cast(greatest(0, least({grid_max}, floor((x + {half}) / {bin_size}))) AS BIGINT) AS x_bin_id,
                 cast(greatest(0, least({grid_max}, floor((y + {half}) / {bin_size}))) AS BIGINT) AS y_bin_id,
-                value
-            FROM base
-            WHERE x IS NOT NULL AND y IS NOT NULL AND value IS NOT NULL
+                image_value,
+                raw_n
+            FROM image_values
+            WHERE x IS NOT NULL AND y IS NOT NULL AND image_value IS NOT NULL
               AND sqrt(pow(x, 2) + pow(y, 2)) <= {half}
         )
         SELECT
+               x_bin_id,
+               y_bin_id,
                x_bin_id * {bin_size} - {half} + ({bin_size} / 2.0) AS x_bin,
                y_bin_id * {bin_size} - {half} + ({bin_size} / 2.0) AS y_bin,
-               avg(value) AS value_mean, min(value) AS value_min,
-               max(value) AS value_max, count(*) AS n
+               avg(image_value) AS value_mean, min(image_value) AS value_min,
+               max(image_value) AS value_max, count(*) AS image_n,
+               sum(raw_n) AS raw_n
         FROM binned
         GROUP BY x_bin_id, y_bin_id
         ORDER BY y_bin_id, x_bin_id
         """.format(
+            image_col=quote_ident(actual_image_col),
             x_value=x_value,
             y_value=y_value,
             value=value,
@@ -850,6 +872,92 @@ def query_wafer_value_heatmap(
             bin_size=bin_value,
             grid_max=grid_max,
         )
+        return src.con.execute(sql).fetchdf()
+    finally:
+        src.close()
+
+
+def query_die_value_map(
+    path: os.PathLike,
+    value_col: str = "CD",
+    filters: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
+    memory_limit: str = "4GB",
+) -> pd.DataFrame:
+    """Return one equally weighted value per DieIDX/DieIDY location.
+
+    When ImageID is available, every image is averaged first so a dense image does
+    not outweigh a sparse image within the same die.
+    """
+    columns = require_columns(path, ["DieIDX", "DieIDY", value_col], "By Die value map")
+    die_x_col = resolve_column(columns, "DieIDX")
+    die_y_col = resolve_column(columns, "DieIDY")
+    actual_value_col = resolve_column(columns, value_col)
+    has_image_id = has_columns(columns, ["ImageID"])
+    src = open_source(path, memory_limit=memory_limit)
+    try:
+        where = where_from_filters(filters, columns)
+        die_x = "try_cast({} AS BIGINT)".format(quote_ident(die_x_col))
+        die_y = "try_cast({} AS BIGINT)".format(quote_ident(die_y_col))
+        value = "try_cast({} AS DOUBLE)".format(quote_ident(actual_value_col))
+        if has_image_id:
+            image_col = quote_ident(resolve_column(columns, "ImageID"))
+            sql = """
+            WITH raw AS (
+                SELECT
+                    cast({image_col} AS VARCHAR) AS image_id,
+                    {die_x} AS die_x,
+                    {die_y} AS die_y,
+                    {value} AS value
+                FROM {source}
+                {where_clause}
+            ),
+            image_values AS (
+                SELECT image_id, die_x, die_y, avg(value) AS image_value, count(*) AS raw_n
+                FROM raw
+                WHERE image_id IS NOT NULL AND die_x IS NOT NULL AND die_y IS NOT NULL AND value IS NOT NULL
+                GROUP BY image_id, die_x, die_y
+            )
+            SELECT
+                die_x AS die_idx,
+                die_y AS die_idy,
+                avg(image_value) AS value_mean,
+                min(image_value) AS value_min,
+                max(image_value) AS value_max,
+                count(*) AS image_n,
+                sum(raw_n) AS raw_n
+            FROM image_values
+            GROUP BY die_x, die_y
+            ORDER BY die_y, die_x
+            """.format(
+                image_col=image_col,
+                die_x=die_x,
+                die_y=die_y,
+                value=value,
+                source=src.relation_sql,
+                where_clause=where,
+            )
+        else:
+            sql = """
+            SELECT
+                {die_x} AS die_idx,
+                {die_y} AS die_idy,
+                avg({value}) AS value_mean,
+                min({value}) AS value_min,
+                max({value}) AS value_max,
+                count(*) AS image_n,
+                count(*) AS raw_n
+            FROM {source}
+            {where_clause}
+            GROUP BY die_idx, die_idy
+            HAVING die_idx IS NOT NULL AND die_idy IS NOT NULL AND value_mean IS NOT NULL
+            ORDER BY die_idy, die_idx
+            """.format(
+                die_x=die_x,
+                die_y=die_y,
+                value=value,
+                source=src.relation_sql,
+                where_clause=where,
+            )
         return src.con.execute(sql).fetchdf()
     finally:
         src.close()
@@ -880,11 +988,12 @@ def query_wafer_loading_heatmap(
         b_where = build_line_filter(line_b.get("LayerType", ""), line_b.get("LayerNO", ""), line_b.get("Moduleindex", ""), columns)
         half = float(wafer_diameter) / 2.0
         bin_value = float(bin_size)
+        if half <= 0 or bin_value <= 0:
+            raise ValueError("Wafer diameter and heatmap bin size must be greater than zero.")
         grid_max = int(math.ceil((2.0 * half) / bin_value)) - 1
         x_value = "try_cast({} AS DOUBLE) - ({})".format(quote_ident(x_col), float(radius_center[0]))
         y_value = "try_cast({} AS DOUBLE) - ({})".format(quote_ident(y_col), float(radius_center[1]))
         value = "try_cast({} AS DOUBLE)".format(quote_ident(actual_value_col))
-        label_expr = layer_label_expr(columns)
         if operation == "subtract":
             metric = "a.cd_value - b.cd_value"
         elif operation == "add":
@@ -898,36 +1007,35 @@ def query_wafer_loading_heatmap(
                 cast({image_col} AS VARCHAR) AS image_id,
                 {x_value} AS x,
                 {y_value} AS y,
-                {value} AS cd_value,
-                {label_expr} AS line_label
+                {value} AS cd_value
             FROM {source}
             {a_where}
         ),
         b_raw AS (
             SELECT
                 cast({image_col} AS VARCHAR) AS image_id,
-                {value} AS cd_value,
-                {label_expr} AS line_label
+                {value} AS cd_value
             FROM {source}
             {b_where}
         ),
         a AS (
-            SELECT image_id, line_label, avg(x) AS x, avg(y) AS y, avg(cd_value) AS cd_value
+            SELECT image_id, avg(x) AS x, avg(y) AS y, avg(cd_value) AS cd_value, count(*) AS raw_n
             FROM a_raw
             WHERE image_id IS NOT NULL AND x IS NOT NULL AND y IS NOT NULL AND cd_value IS NOT NULL
-            GROUP BY image_id, line_label
+            GROUP BY image_id
         ),
         b AS (
-            SELECT image_id, line_label, avg(cd_value) AS cd_value
+            SELECT image_id, avg(cd_value) AS cd_value, count(*) AS raw_n
             FROM b_raw
             WHERE image_id IS NOT NULL AND cd_value IS NOT NULL
-            GROUP BY image_id, line_label
+            GROUP BY image_id
         ),
         paired AS (
             SELECT
                 a.x,
                 a.y,
-                {metric} AS loading_value
+                {metric} AS loading_value,
+                a.raw_n + b.raw_n AS raw_n
             FROM a
             INNER JOIN b ON a.image_id = b.image_id
         ),
@@ -935,16 +1043,20 @@ def query_wafer_loading_heatmap(
             SELECT
                 cast(greatest(0, least({grid_max}, floor((x + {half}) / {bin_size}))) AS BIGINT) AS x_bin_id,
                 cast(greatest(0, least({grid_max}, floor((y + {half}) / {bin_size}))) AS BIGINT) AS y_bin_id,
-                loading_value
+                loading_value,
+                raw_n
             FROM paired
             WHERE x IS NOT NULL AND y IS NOT NULL AND loading_value IS NOT NULL
               AND sqrt(pow(x, 2) + pow(y, 2)) <= {half}
         )
         SELECT
+               x_bin_id,
+               y_bin_id,
                x_bin_id * {bin_size} - {half} + ({bin_size} / 2.0) AS x_bin,
                y_bin_id * {bin_size} - {half} + ({bin_size} / 2.0) AS y_bin,
                avg(loading_value) AS value_mean, min(loading_value) AS value_min,
-               max(loading_value) AS value_max, count(*) AS n
+               max(loading_value) AS value_max, count(*) AS image_n,
+               sum(raw_n) AS raw_n
         FROM binned
         GROUP BY x_bin_id, y_bin_id
         ORDER BY y_bin_id, x_bin_id
@@ -953,7 +1065,6 @@ def query_wafer_loading_heatmap(
             x_value=x_value,
             y_value=y_value,
             value=value,
-            label_expr=label_expr,
             source=src.relation_sql,
             a_where=a_where,
             b_where=b_where,

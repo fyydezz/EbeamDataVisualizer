@@ -10,8 +10,10 @@ from tkinter import filedialog, messagebox, ttk
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.collections import PatchCollection
+from matplotlib.patches import Rectangle
 
-from ebeam_backend import RADIUS_COLUMN, distinct_values, list_columns, list_plot_columns, query_fin_center_loading, query_layer_histogram, query_line_loading, query_radius_aggregate, query_radius_sigma, query_wafer_loading_heatmap, query_wafer_value_heatmap, query_xy, split_filter_values
+from ebeam_backend import RADIUS_COLUMN, distinct_values, list_columns, list_plot_columns, query_die_value_map, query_fin_center_loading, query_layer_histogram, query_line_loading, query_radius_aggregate, query_radius_sigma, query_wafer_loading_heatmap, query_wafer_value_heatmap, query_xy, split_filter_values
 
 
 SERIES_COLORS = ["#1F5A8A", "#C28E2C", "#6E8B3D", "#B05A7A", "#58606F", "#5B8C8C", "#8A6FB0", "#A85C3A"]
@@ -38,6 +40,9 @@ class EbeamVisualizerApp(tk.Tk):
         self.color_min = tk.StringVar()
         self.color_max = tk.StringVar()
         self.colormap = tk.StringVar(value="jet")
+        self.heatmap_render = tk.StringVar(value="Smooth local")
+        self.die_size_x = tk.DoubleVar(value=10.0)
+        self.die_size_y = tk.DoubleVar(value=10.0)
         self.sigma_mode = tk.StringVar(value="radius_bin")
         self.sample_rows = tk.IntVar(value=150000)
         self.data_mode = tk.StringVar(value="Sample")
@@ -84,6 +89,8 @@ class EbeamVisualizerApp(tk.Tk):
         self.panel_grid_options = {}
         self.style_controls = {}
         self.style_grid_options = {}
+        self.die_map_widgets = []
+        self.die_map_grid_options = {}
         self.last_plot_kind = None
         self.last_plot_payload = None
         self._style_redraw_job = None
@@ -140,6 +147,7 @@ class EbeamVisualizerApp(tk.Tk):
                 "FIN center loading",
                 "Wafer value heatmap",
                 "Wafer loading heatmap",
+                "By Die value map",
                 "Custom X-Y scatter",
             ],
             state="readonly",
@@ -179,6 +187,17 @@ class EbeamVisualizerApp(tk.Tk):
         ttk.Entry(heatmap_frame, textvariable=self.color_max, width=9).grid(row=1, column=3, sticky="ew", padx=(4, 0), pady=(4, 0))
         ttk.Label(heatmap_frame, text="Map").grid(row=2, column=0, sticky="w", pady=(4, 0))
         ttk.Combobox(heatmap_frame, textvariable=self.colormap, values=["jet", "turbo", "RdYlBu_r", "coolwarm", "viridis", "plasma", "inferno", "magma", "cividis"], state="readonly", width=14).grid(row=2, column=1, columnspan=3, sticky="ew", padx=(4, 0), pady=(4, 0))
+        ttk.Label(heatmap_frame, text="Render").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Combobox(heatmap_frame, textvariable=self.heatmap_render, values=["Smooth local", "Measured cells"], state="readonly", width=14).grid(row=3, column=1, columnspan=3, sticky="ew", padx=(4, 0), pady=(4, 0))
+        die_x_label = ttk.Label(heatmap_frame, text="Die X size")
+        die_x_label.grid(row=4, column=0, sticky="w", pady=(4, 0))
+        die_x_entry = ttk.Entry(heatmap_frame, textvariable=self.die_size_x, width=9)
+        die_x_entry.grid(row=4, column=1, sticky="ew", padx=(4, 8), pady=(4, 0))
+        die_y_label = ttk.Label(heatmap_frame, text="Die Y size")
+        die_y_label.grid(row=4, column=2, sticky="w", pady=(4, 0))
+        die_y_entry = ttk.Entry(heatmap_frame, textvariable=self.die_size_y, width=9)
+        die_y_entry.grid(row=4, column=3, sticky="ew", padx=(4, 0), pady=(4, 0))
+        self._remember_die_map_controls(die_x_label, die_x_entry, die_y_label, die_y_entry)
 
         center_frame = ttk.LabelFrame(panel, text="Wafer center for Radius", padding=6)
         center_frame.grid(row=16, column=0, sticky="ew", pady=(2, 8))
@@ -352,6 +371,11 @@ class EbeamVisualizerApp(tk.Tk):
             if info:
                 self.style_grid_options[widget] = dict(info)
 
+    def _remember_die_map_controls(self, *widgets) -> None:
+        self.die_map_widgets.extend(widgets)
+        for widget in widgets:
+            self.die_map_grid_options[widget] = dict(widget.grid_info())
+
     def browse_file(self) -> None:
         path = filedialog.askopenfilename(
             filetypes=[
@@ -400,9 +424,11 @@ class EbeamVisualizerApp(tk.Tk):
         elif chart == "Layer CD distribution":
             self.status.set("This chart groups by available LayerType, LayerNO, Moduleindex columns. Missing layer columns are skipped.")
         elif chart == "Wafer value heatmap":
-            self.status.set("Wafer value heatmap uses WaferPosX/Y and the selected Value column.")
+            self.status.set("Each ImageID is averaged first, then image-level values are averaged into wafer grid cells.")
         elif chart == "Wafer loading heatmap":
-            self.status.set("Wafer loading heatmap averages each ImageID line, compares Line A/B, then maps loading on wafer X/Y.")
+            self.status.set("Each ImageID averages Line A and B separately, calculates loading, then maps one loading value per image.")
+        elif chart == "By Die value map":
+            self.status.set("Each die is centered at DieIDX/DieIDY = 0,0 and averages its ImageID-level values.")
         else:
             self.status.set("Custom scatter uses selected X/Y columns. Radius is a computed virtual X/Y option when available.")
         self.update_control_visibility()
@@ -429,6 +455,9 @@ class EbeamVisualizerApp(tk.Tk):
             self.color_min,
             self.color_max,
             self.colormap,
+            self.heatmap_render,
+            self.die_size_x,
+            self.die_size_y,
         ]
         for var in style_vars:
             var.trace_add("write", self._schedule_style_redraw)
@@ -483,6 +512,9 @@ class EbeamVisualizerApp(tk.Tk):
         elif chart == "Wafer loading heatmap":
             rows |= {10, 11, 15, 16, 25, 26, 27} | set(range(29, 45)) | {53, 54, 55}
             style_groups = {"axis"}
+        elif chart == "By Die value map":
+            rows |= {10, 11, 15, 25, 26, 27, 28}
+            style_groups = {"axis"}
         else:
             rows |= set(range(6, 10)) | set(range(16, 29))
             style_groups = {"scatter", "axis"}
@@ -499,6 +531,12 @@ class EbeamVisualizerApp(tk.Tk):
             else:
                 child.grid_remove()
         self._update_style_visibility(style_groups)
+        show_die_controls = chart == "By Die value map"
+        for widget in self.die_map_widgets:
+            if show_die_controls:
+                widget.grid(**self.die_map_grid_options[widget])
+            else:
+                widget.grid_remove()
 
     def _update_style_visibility(self, visible_groups) -> None:
         for group, widgets in self.style_controls.items():
@@ -768,6 +806,14 @@ class EbeamVisualizerApp(tk.Tk):
                 )
                 self._raise_if_empty(df, chart, line_filters)
                 self.result_queue.put(("wafer_loading_heatmap", df))
+            elif chart == "By Die value map":
+                df = query_die_value_map(
+                    path,
+                    self.value_col.get(),
+                    filters=filters,
+                )
+                self._raise_if_empty(df, chart, filters)
+                self.result_queue.put(("die_value_map", df))
             else:
                 use_sample = self.data_mode.get() == "Sample"
                 df = query_xy(
@@ -953,11 +999,13 @@ class EbeamVisualizerApp(tk.Tk):
             title = "Wafer {} Heatmap".format(self.value_col.get()) if kind == "wafer_value_heatmap" else "Wafer Loading Heatmap ({})".format(self.operation.get())
             label = self.value_col.get() if kind == "wafer_value_heatmap" else "{} loading".format(self.value_col.get())
             self._draw_wafer_heatmap(ax, df, title, label)
+        elif kind == "die_value_map":
+            self._draw_die_map(axes[0], payload, "By Die {} Map".format(self.value_col.get()), self.value_col.get())
 
         for ax in axes:
             if overlay and len(labels) > 1:
                 ax.legend(fontsize=8)
-            if kind in {"wafer_value_heatmap", "wafer_loading_heatmap"}:
+            if kind in {"wafer_value_heatmap", "wafer_loading_heatmap", "die_value_map"}:
                 ax.grid(False)
             else:
                 ax.grid(True, color="#D7DEE8", linewidth=0.7, alpha=0.8)
@@ -989,9 +1037,9 @@ class EbeamVisualizerApp(tk.Tk):
         elif kind == "scatter":
             df = payload
             labels = df["layer_label"].astype(str).value_counts().index.tolist() if not df.empty else []
-        elif kind in {"wafer_value_heatmap", "wafer_loading_heatmap"}:
+        elif kind in {"wafer_value_heatmap", "wafer_loading_heatmap", "die_value_map"}:
             df = payload
-            labels = ["Wafer map"] if not df.empty else []
+            labels = ["Map"] if not df.empty else []
         else:
             df = payload
             if df.empty:
@@ -1081,6 +1129,7 @@ class EbeamVisualizerApp(tk.Tk):
             "fin_center_loading": "FIN Center Loading by Wafer Radius",
             "wafer_value_heatmap": "Wafer Value Heatmap",
             "wafer_loading_heatmap": "Wafer Loading Heatmap",
+            "die_value_map": "By Die Value Map",
             "scatter": "{} vs {}".format(self.y_axis.get(), self.x_axis.get()),
         }
         return headings.get(kind, "Ebeam Data Visualizer")
@@ -1097,7 +1146,8 @@ class EbeamVisualizerApp(tk.Tk):
         mask_x, mask_y = np.meshgrid(x_centers, y_centers)
         inside = np.sqrt(mask_x ** 2 + mask_y ** 2) <= half
         z = np.where(inside, z, np.nan)
-        z = self._fill_heatmap_gaps(z, inside)
+        if self.heatmap_render.get() == "Smooth local":
+            z = self._smooth_heatmap_gaps(z, inside)
         if not np.isfinite(z).any():
             raise ValueError("No finite wafer heatmap cells found after binning. Try a larger Heatmap bin or clear filters.")
         vmin, vmax = self._color_limits()
@@ -1108,7 +1158,7 @@ class EbeamVisualizerApp(tk.Tk):
             extent=(-half, half, -half, half),
             origin="lower",
             cmap=cmap,
-            interpolation="bilinear",
+            interpolation="bilinear" if self.heatmap_render.get() == "Smooth local" else "nearest",
             vmin=vmin,
             vmax=vmax,
         )
@@ -1123,48 +1173,140 @@ class EbeamVisualizerApp(tk.Tk):
         cbar = self.fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label(colorbar_label)
 
+    def _draw_die_map(self, ax, df, title: str, colorbar_label: str) -> None:
+        die_x_size = float(self.die_size_x.get())
+        die_y_size = float(self.die_size_y.get())
+        if die_x_size <= 0 or die_y_size <= 0:
+            raise ValueError("Die X size and Die Y size must be greater than zero.")
+        values = df[["die_idx", "die_idy", "value_mean"]].dropna().to_numpy(dtype=float)
+        if not values.size:
+            raise ValueError("No valid DieIDX/DieIDY values found for the selected filters.")
+        cmap = plt.get_cmap(self.colormap.get()).copy()
+        cmap.set_bad((1, 1, 1, 0))
+        patches = []
+        for die_x, die_y, _value in values:
+            center_x = die_x * die_x_size
+            center_y = die_y * die_y_size
+            patches.append(Rectangle((center_x - die_x_size / 2.0, center_y - die_y_size / 2.0), die_x_size, die_y_size))
+        vmin, vmax = self._color_limits()
+        collection = PatchCollection(patches, cmap=cmap, edgecolor="#FFFFFF", linewidth=0.18)
+        collection.set_array(values[:, 2])
+        collection.set_clim(vmin, vmax)
+        ax.add_collection(collection)
+        min_x, max_x = values[:, 0].min(), values[:, 0].max()
+        min_y, max_y = values[:, 1].min(), values[:, 1].max()
+        ax.set_xlim((min_x - 0.5) * die_x_size, (max_x + 0.5) * die_x_size)
+        ax.set_ylim((min_y - 0.5) * die_y_size, (max_y + 0.5) * die_y_size)
+        wafer_diameter = float(self.wafer_diameter.get())
+        if wafer_diameter > 0:
+            ax.add_patch(plt.Circle((0, 0), wafer_diameter / 2.0, edgecolor="#2E3440", facecolor="none", linewidth=1.0))
+        ax.axhline(0, color="#58606F", linewidth=0.6, alpha=0.6)
+        ax.axvline(0, color="#58606F", linewidth=0.6, alpha=0.6)
+        ax.set_aspect("equal", adjustable="box")
+        self._configure_axis(ax, title, "DieIDX position", "DieIDY position")
+        cbar = self.fig.colorbar(collection, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(colorbar_label)
+
     def _heatmap_matrix(self, df, half: float, bin_size: float):
         grid_count = max(int(math.ceil((2.0 * half) / bin_size)), 1)
         first_center = -half + bin_size / 2.0
         x_centers = first_center + np.arange(grid_count) * bin_size
         y_centers = first_center + np.arange(grid_count) * bin_size
         z = np.full((grid_count, grid_count), np.nan, dtype=float)
-        values = df[["x_bin", "y_bin", "value_mean"]].dropna().to_numpy(dtype=float)
-        if values.size:
+        if {"x_bin_id", "y_bin_id"}.issubset(df.columns):
+            values = df[["x_bin_id", "y_bin_id", "value_mean"]].dropna().to_numpy(dtype=float)
+            x_idx = values[:, 0].astype(int)
+            y_idx = values[:, 1].astype(int)
+        else:
+            values = df[["x_bin", "y_bin", "value_mean"]].dropna().to_numpy(dtype=float)
             x_idx = np.rint((values[:, 0] - first_center) / bin_size).astype(int)
             y_idx = np.rint((values[:, 1] - first_center) / bin_size).astype(int)
+        if values.size:
             valid = (x_idx >= 0) & (x_idx < grid_count) & (y_idx >= 0) & (y_idx < grid_count)
-            z[y_idx[valid], x_idx[valid]] = values[valid, 2]
+            z[y_idx[valid], x_idx[valid]] = values[valid, -1]
         return x_centers, y_centers, z
 
-    def _fill_heatmap_gaps(self, z, inside):
-        original = np.isfinite(z)
-        if not original.any():
-            return z
-        row_filled = self._interpolate_nan_axis(z, axis=1)
-        col_filled = self._interpolate_nan_axis(z, axis=0)
-        row_ok = np.isfinite(row_filled)
-        col_ok = np.isfinite(col_filled)
-        filled = z.copy()
-        both = (~original) & row_ok & col_ok
-        filled[both] = (row_filled[both] + col_filled[both]) / 2.0
-        row_only = (~original) & row_ok & ~col_ok
-        filled[row_only] = row_filled[row_only]
-        col_only = (~original) & ~row_ok & col_ok
-        filled[col_only] = col_filled[col_only]
-        filled[original] = z[original]
-        return np.where(inside, filled, np.nan)
+    @staticmethod
+    def _shift_grid(values, dy, dx, fill_value=np.nan):
+        shifted = np.full_like(values, fill_value)
+        if abs(dy) >= values.shape[0] or abs(dx) >= values.shape[1]:
+            return shifted
+        source_y0, source_y1 = max(0, -dy), values.shape[0] - max(0, dy)
+        source_x0, source_x1 = max(0, -dx), values.shape[1] - max(0, dx)
+        target_y0, target_y1 = max(0, dy), values.shape[0] - max(0, -dy)
+        target_x0, target_x1 = max(0, dx), values.shape[1] - max(0, -dx)
+        shifted[target_y0:target_y1, target_x0:target_x1] = values[source_y0:source_y1, source_x0:source_x1]
+        return shifted
 
-    def _interpolate_nan_axis(self, arr, axis: int):
-        work = arr.T.copy() if axis == 0 else arr.copy()
-        x = np.arange(work.shape[1])
-        out = np.full_like(work, np.nan, dtype=float)
-        for row_index in range(work.shape[0]):
-            row = work[row_index]
-            valid = np.isfinite(row)
-            if valid.any():
-                out[row_index] = np.interp(x, x[valid], row[valid])
-        return out.T if axis == 0 else out
+    def _smooth_heatmap_gaps(self, z, inside):
+        """Use local averaging first, then nearest-image completion for display only."""
+        filled = np.where(inside, z, np.nan).copy()
+        if not np.isfinite(filled).any():
+            return filled
+        original = np.isfinite(filled)
+        neighbours = [
+            (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+            (-1, -1, 0.707), (-1, 1, 0.707), (1, -1, 0.707), (1, 1, 0.707),
+        ]
+        for _ in range(32):
+            missing = inside & ~np.isfinite(filled)
+            if not missing.any():
+                break
+            numerator = np.zeros_like(filled, dtype=float)
+            denominator = np.zeros_like(filled, dtype=float)
+            for dy, dx, weight in neighbours:
+                neighbour = self._shift_grid(filled, dy, dx)
+                valid = np.isfinite(neighbour)
+                numerator[valid] += neighbour[valid] * weight
+                denominator[valid] += weight
+            update = missing & (denominator > 0)
+            if not update.any():
+                break
+            filled[update] = numerator[update] / denominator[update]
+        filled[original] = z[original]
+        return self._nearest_image_completion(filled, inside)
+
+    def _nearest_image_completion(self, z, inside):
+        """Fill any remaining wafer cells with the nearest measured/display value.
+
+        The jump-flood search completes sparse small-bin maps in logarithmic passes,
+        unlike row/column extrapolation which can create directional artifacts.
+        """
+        valid = np.isfinite(z) & inside
+        if not valid.any():
+            return z
+        rows, cols = z.shape
+        yy, xx = np.indices(z.shape)
+        nearest_y = np.where(valid, yy, -1)
+        nearest_x = np.where(valid, xx, -1)
+        step = 1
+        while step < max(rows, cols):
+            step *= 2
+        while step:
+            current_valid = nearest_y >= 0
+            current_distance = np.where(
+                current_valid,
+                (yy - nearest_y) ** 2 + (xx - nearest_x) ** 2,
+                np.inf,
+            )
+            for dy in (-step, 0, step):
+                for dx in (-step, 0, step):
+                    if dy == 0 and dx == 0:
+                        continue
+                    candidate_y = self._shift_grid(nearest_y, dy, dx, fill_value=-1)
+                    candidate_x = self._shift_grid(nearest_x, dy, dx, fill_value=-1)
+                    candidate_valid = candidate_y >= 0
+                    candidate_distance = (yy - candidate_y) ** 2 + (xx - candidate_x) ** 2
+                    replace = candidate_valid & ((~current_valid) | (candidate_distance < current_distance))
+                    nearest_y[replace] = candidate_y[replace]
+                    nearest_x[replace] = candidate_x[replace]
+                    current_valid[replace] = True
+                    current_distance[replace] = candidate_distance[replace]
+            step //= 2
+        completed = z.copy()
+        missing = inside & ~np.isfinite(completed) & (nearest_y >= 0)
+        completed[missing] = z[nearest_y[missing], nearest_x[missing]]
+        return np.where(inside, completed, np.nan)
 
     def _axis_label(self, axis: str, default: str) -> str:
         custom = self.x_label.get().strip() if axis == "x" else self.y_label.get().strip()
